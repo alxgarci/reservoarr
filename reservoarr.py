@@ -110,9 +110,16 @@ AUDIO_CODEC_REQUESTED = os.getenv("RESV_AUDIO_CODEC", "ac3").strip().lower()
 AUDIO_CODEC = AUDIO_CODEC_REQUESTED if AUDIO_CODEC_REQUESTED in AUDIO_ARGS else "ac3"
 AUDIO_FILL_GAPS = os.getenv("RESV_AUDIO_FILL_GAPS", "0") == "1"
 AUDIO_TRACK_REQUESTED = os.getenv("RESV_AUDIO_TRACK", "").strip()
-AUDIO_TRACK_OK = re.fullmatch(r"[1-9][0-9]*", AUDIO_TRACK_REQUESTED, re.ASCII) is not None
-AUDIO_TRACK = int(AUDIO_TRACK_REQUESTED) if AUDIO_TRACK_OK else 1       # user-facing track number, starts at 1
-AUDIO_TRACK_FORCED = bool(AUDIO_TRACK_REQUESTED) and AUDIO_TRACK_OK
+AUDIO_TRACK_OK = (not AUDIO_TRACK_REQUESTED
+                  or re.fullmatch(r"[1-9][0-9]*(?:\s*,\s*[1-9][0-9]*)*",
+                                  AUDIO_TRACK_REQUESTED, re.ASCII) is not None)
+if AUDIO_TRACK_REQUESTED and AUDIO_TRACK_OK:
+    AUDIO_TRACKS = tuple(dict.fromkeys(int(track.strip()) for track in AUDIO_TRACK_REQUESTED.split(",")))
+else:
+    AUDIO_TRACKS = (1,)
+AUDIO_TRACK = AUDIO_TRACKS[0]                                        # user-facing track number, starts at 1
+AUDIO_TRACK_FORCED = bool(AUDIO_TRACK_REQUESTED) and AUDIO_TRACK_OK and len(AUDIO_TRACKS) == 1
+AUDIO_TRACK_PRIORITY = bool(AUDIO_TRACK_REQUESTED) and AUDIO_TRACK_OK and len(AUDIO_TRACKS) > 1
 AUDIO_START_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_START_ERRORS", "").strip()
 AUDIO_START_ERRORS_OK = (not AUDIO_START_ERRORS_REQUESTED
                          or re.fullmatch(r"[0-9]{1,9}", AUDIO_START_ERRORS_REQUESTED, re.ASCII) is not None)
@@ -121,6 +128,10 @@ AUDIO_LIVE_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_LIVE_ERRORS", "").strip()
 AUDIO_LIVE_ERRORS_OK = (not AUDIO_LIVE_ERRORS_REQUESTED
                         or re.fullmatch(r"[0-9]{1,9}", AUDIO_LIVE_ERRORS_REQUESTED, re.ASCII) is not None)
 AUDIO_LIVE_ERRORS = int(AUDIO_LIVE_ERRORS_REQUESTED) if AUDIO_LIVE_ERRORS_OK and AUDIO_LIVE_ERRORS_REQUESTED else 0
+AUDIO_OFFSET_MS_REQUESTED = os.getenv("RESV_AUDIO_OFFSET_MS", "").strip()
+AUDIO_OFFSET_MS_OK = (not AUDIO_OFFSET_MS_REQUESTED
+                      or re.fullmatch(r"-?[0-9]{1,6}", AUDIO_OFFSET_MS_REQUESTED, re.ASCII) is not None)
+AUDIO_OFFSET_MS = int(AUDIO_OFFSET_MS_REQUESTED) if AUDIO_OFFSET_MS_OK and AUDIO_OFFSET_MS_REQUESTED else 0
 AUDIO_PROBE_BYTES = 3 * 1024 * 1024
 AUDIO_PROBE_TIMEOUT_S = 5.0
 AUDIO_DISCONTINUITY_RE = re.compile(rb"\[aist#0:\d+/[^\]]+\].*timestamp discontinuity")
@@ -148,6 +159,11 @@ FFMPEG_STATS = os.getenv("RESV_FFMPEG_STATS", "0") == "1"
 # any other value as no tag at all, and "FRA" is stored as typed.
 AUDIO_LANG = os.getenv("RESV_AUDIO_LANG", "").strip().lower()
 AUDIO_LANG_OK = re.fullmatch(r"[a-z]{3}", AUDIO_LANG) is not None
+AUDIO_FILTERS = []
+if AUDIO_FILL_GAPS:
+    AUDIO_FILTERS.append("aresample=async=1")
+if AUDIO_OFFSET_MS:
+    AUDIO_FILTERS.append(f"asetpts=PTS{AUDIO_OFFSET_MS / 1000:+.3f}/TB")
 # No `-fflags +nobuffer`: it costs the whole first GOP of video. The demuxer
 # hands packets on before it has the video's parameter sets, so ffmpeg emits
 # audio from the first sample and video only from the next IDR. On a channel
@@ -164,7 +180,7 @@ FFMPEG_CMD = [
     "-map", "0:v", "-map", f"0:a:{AUDIO_TRACK - 1}",
     "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
     *AUDIO_ARGS[AUDIO_CODEC],
-    *(["-af", "aresample=async=1"] if AUDIO_FILL_GAPS else []),
+    *(["-af", ",".join(AUDIO_FILTERS)] if AUDIO_FILTERS else []),
     *(["-metadata:s:a:0", f"language={AUDIO_LANG}"] if AUDIO_LANG_OK else []),
     "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "pipe:1",
 ]
@@ -1535,8 +1551,12 @@ def announce_audio_codec():
 
 def announce_audio_track():
     if AUDIO_TRACK_REQUESTED and not AUDIO_TRACK_OK:
-        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK_REQUESTED!r} is not a positive track number (e.g. 3); "
+        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK_REQUESTED!r} is not a positive track or priority list "
+            "(e.g. 3 or 1,5,6); "
             "selecting source audio track 1")
+    elif AUDIO_TRACK_PRIORITY:
+        log(f"source audio track priority is {','.join(map(str, AUDIO_TRACKS))}; "
+            f"starting with track {AUDIO_TRACK}")
     elif AUDIO_TRACK != 1:
         log(f"selecting source audio track {AUDIO_TRACK} (ffmpeg map 0:a:{AUDIO_TRACK - 1})")
 
@@ -1563,14 +1583,15 @@ def audio_probe_errors(snapshot, track):
 
 
 class AudioTrackSelector:
-    """Opt-in source-track failover. A valid RESV_AUDIO_TRACK is an explicit
-    instruction and disables both automatic paths. Startup probes a copy of the
-    prefill, so it consumes no live bytes. Live failover asks the pump to retire
-    ffmpeg and start a new one on the next PMT audio track."""
+    """Opt-in source-track failover. One RESV_AUDIO_TRACK is authoritative;
+    several are the only permitted tracks, in priority order. Startup probes a
+    copy of the prefill, so it consumes no live bytes. Live failover asks the
+    pump to retire ffmpeg and start a new one on the next permitted PMT track."""
 
     def __init__(self):
         self.current = AUDIO_TRACK
         self.forced = AUDIO_TRACK_FORCED
+        self.priority = AUDIO_TRACKS if AUDIO_TRACK_PRIORITY else ()
         self.start_errors = 0 if self.forced else AUDIO_START_ERRORS
         self.live_errors = 0 if self.forced else AUDIO_LIVE_ERRORS
         self.live_enabled = self.live_errors > 0
@@ -1580,17 +1601,26 @@ class AudioTrackSelector:
         self.switch = threading.Event()
         self.lock = threading.Lock()
 
+    def candidates(self, count):
+        if self.priority:
+            return [track for track in self.priority if track <= count]
+        return list(range(1, count + 1))
+
     def choose_start(self, snapshot, count):
         self.count = max(1, count)
-        if not self.start_errors or self.count < 2:
-            if self.start_errors and self.count < 2:
-                log("startup audio probe: the initial PMT exposes fewer than two audio tracks; keeping track 1")
+        candidates = self.candidates(self.count)
+        fallback = candidates[0] if candidates else AUDIO_TRACK
+        self.current = fallback
+        if not self.start_errors or len(candidates) < 2:
+            if self.start_errors and len(candidates) < 2:
+                log("startup audio probe: fewer than two permitted audio tracks are present; "
+                    f"keeping track {fallback}")
             return self.current
-        for track in range(1, self.count + 1):
+        for track in candidates:
             errors = audio_probe_errors(snapshot, track)
             if errors is None:
-                log(f"startup audio probe could not evaluate track {track}; keeping track 1")
-                self.current = 1
+                log(f"startup audio probe could not evaluate track {track}; keeping track {fallback}")
+                self.current = fallback
                 self.bad.clear()
                 return self.current
             log(f"startup audio probe: track {track} has {errors} audio timestamp discontinuities "
@@ -1601,9 +1631,9 @@ class AudioTrackSelector:
                     log(f"startup audio probe selected track {track} (ffmpeg map 0:a:{track - 1})")
                 return self.current
             self.bad.add(track)
-        self.current = 1
-        log(f"startup audio probe: all {self.count} tracks reached {self.start_errors} discontinuities; "
-            "falling back to track 1")
+        self.current = fallback
+        log(f"startup audio probe: all {len(candidates)} permitted tracks reached "
+            f"{self.start_errors} discontinuities; falling back to track {fallback}")
         return self.current
 
     def on_discontinuity(self):
@@ -1617,14 +1647,21 @@ class AudioTrackSelector:
     def take_switch(self, count):
         """Return the next track after the live threshold, None to keep the
         current ffmpeg. Every track is tried at most once; when all are bad the
-        selector returns to track 1 and disables itself to avoid a restart loop."""
+        selector returns to the first permitted track and disables itself to
+        avoid a restart loop."""
         with self.lock:
             if not self.switch.is_set():
                 return None
-            self.count = max(self.count, count, 1)
+            self.count = max(count, 1)
             failed = self.current
             self.bad.add(failed)
-            order = list(range(failed + 1, self.count + 1)) + list(range(1, failed))
+            candidates = self.candidates(self.count)
+            fallback = candidates[0] if candidates else AUDIO_TRACK
+            if failed in candidates:
+                at = candidates.index(failed)
+                order = candidates[at + 1:] + candidates[:at]
+            else:
+                order = candidates
             candidates = [track for track in order if track not in self.bad]
             self.switch.clear()
             self.errors = 0
@@ -1634,12 +1671,12 @@ class AudioTrackSelector:
                     f"switching live to track {self.current} (ffmpeg map 0:a:{self.current - 1})")
                 return self.current
             self.live_enabled = False
-            if self.current != 1:
-                self.current = 1
-                log(f"all {self.count} audio tracks reached the live threshold; returning to track 1 "
+            if self.current != fallback:
+                self.current = fallback
+                log(f"all permitted audio tracks reached the live threshold; returning to track {fallback} "
                     "and disabling automatic live switching")
                 return self.current
-            log(f"all {self.count} audio tracks reached the live threshold; staying on track 1 "
+            log(f"all permitted audio tracks reached the live threshold; staying on track {fallback} "
                 "and disabling automatic live switching")
             return None
 
@@ -1753,8 +1790,9 @@ class Stream:
             f"releasing stream to ffmpeg")
 
         selector = AudioTrackSelector()
-        if selector.start_errors:
-            selector.choose_start(self.reservoir.snapshot(AUDIO_PROBE_BYTES), len(self.parser.audio_pids))
+        if selector.start_errors or selector.priority:
+            snapshot = self.reservoir.snapshot(AUDIO_PROBE_BYTES) if selector.start_errors else b""
+            selector.choose_start(snapshot, len(self.parser.audio_pids))
         timeline = (Timeline(timeline_path(), time.time()) if TS_CHANNEL else
                     Timeline(None, time.time()) if selector.live_enabled else None)
         if STALL_S > 0:
@@ -1900,6 +1938,11 @@ def main():
         log(f"RESV_AUDIO_START_ERRORS={AUDIO_START_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
     if not AUDIO_LIVE_ERRORS_OK:
         log(f"RESV_AUDIO_LIVE_ERRORS={AUDIO_LIVE_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
+    if not AUDIO_OFFSET_MS_OK:
+        log(f"RESV_AUDIO_OFFSET_MS={AUDIO_OFFSET_MS_REQUESTED!r} is not a signed integer; disabled")
+    elif AUDIO_OFFSET_MS:
+        action = "advancing" if AUDIO_OFFSET_MS < 0 else "delaying"
+        log(f"{action} output audio by {abs(AUDIO_OFFSET_MS)}ms (RESV_AUDIO_OFFSET_MS={AUDIO_OFFSET_MS})")
     if AUDIO_TRACK_FORCED and (AUDIO_START_ERRORS or AUDIO_LIVE_ERRORS):
         log(f"RESV_AUDIO_TRACK={AUDIO_TRACK} is forced; automatic startup and live audio selection ignored")
     announce_audio_codec()
