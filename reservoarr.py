@@ -112,6 +112,18 @@ AUDIO_FILL_GAPS = os.getenv("RESV_AUDIO_FILL_GAPS", "0") == "1"
 AUDIO_TRACK_REQUESTED = os.getenv("RESV_AUDIO_TRACK", "").strip()
 AUDIO_TRACK_OK = re.fullmatch(r"[1-9][0-9]*", AUDIO_TRACK_REQUESTED, re.ASCII) is not None
 AUDIO_TRACK = int(AUDIO_TRACK_REQUESTED) if AUDIO_TRACK_OK else 1       # user-facing track number, starts at 1
+AUDIO_TRACK_FORCED = bool(AUDIO_TRACK_REQUESTED) and AUDIO_TRACK_OK
+AUDIO_START_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_START_ERRORS", "").strip()
+AUDIO_START_ERRORS_OK = (not AUDIO_START_ERRORS_REQUESTED
+                         or re.fullmatch(r"[0-9]{1,9}", AUDIO_START_ERRORS_REQUESTED, re.ASCII) is not None)
+AUDIO_START_ERRORS = int(AUDIO_START_ERRORS_REQUESTED) if AUDIO_START_ERRORS_OK and AUDIO_START_ERRORS_REQUESTED else 0
+AUDIO_LIVE_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_LIVE_ERRORS", "").strip()
+AUDIO_LIVE_ERRORS_OK = (not AUDIO_LIVE_ERRORS_REQUESTED
+                        or re.fullmatch(r"[0-9]{1,9}", AUDIO_LIVE_ERRORS_REQUESTED, re.ASCII) is not None)
+AUDIO_LIVE_ERRORS = int(AUDIO_LIVE_ERRORS_REQUESTED) if AUDIO_LIVE_ERRORS_OK and AUDIO_LIVE_ERRORS_REQUESTED else 0
+AUDIO_PROBE_BYTES = 3 * 1024 * 1024
+AUDIO_PROBE_TIMEOUT_S = 5.0
+AUDIO_DISCONTINUITY_RE = re.compile(rb"\[aist#0:\d+/[^\]]+\].*timestamp discontinuity")
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
 REPLAY_HOLD_BYTES = 1024 * 1024
@@ -218,10 +230,15 @@ def log(msg, stderr=True, file=True):
         sys.stderr.flush()
 
 
-def ffmpeg_cmd(ts_offset=None):
+def ffmpeg_cmd(ts_offset=None, audio_track=None):
+    cmd = FFMPEG_CMD
+    if audio_track is not None and audio_track != AUDIO_TRACK:
+        cmd = list(cmd)
+        audio_map = next(i for i, token in enumerate(cmd[:-1]) if token == "-map" and cmd[i + 1].startswith("0:a:"))
+        cmd[audio_map + 1] = f"0:a:{audio_track - 1}"
     if ts_offset is None:
-        return FFMPEG_CMD
-    return [*FFMPEG_CMD[:-1], "-output_ts_offset", f"{ts_offset:.6f}", FFMPEG_CMD[-1]]
+        return cmd
+    return [*cmd[:-1], "-output_ts_offset", f"{ts_offset:.6f}", cmd[-1]]
 
 
 def output_ts_offset(timeline, now):
@@ -294,9 +311,11 @@ def pes_pts(buf_, i):
 
 
 class Timeline:
-    def __init__(self, path, now):
+    def __init__(self, path, now, after=None):
         self.path = path
-        projected = timeline_projection(path, now)
+        projected = timeline_projection(path, now) if path else None
+        if after is not None and math.isfinite(after):
+            projected = after if projected is None else max(projected, after)
         self.origin = now if projected is None else max(now, projected + TS_SEAM_S)
         self.offset = self.origin % TS_WRAP_S
         self.started = time.monotonic()
@@ -320,7 +339,7 @@ class Timeline:
     def save(self, now):
         self.saved_at = time.monotonic()
         end = self.end()
-        if end is None:
+        if end is None or not self.path:
             return
         try:
             with open(f"{self.path}.lock", "a") as lock:
@@ -480,6 +499,7 @@ class TsParser:
         self.rate_marks = deque()                                     # (fed, cum_pcr), ~90s content span
         self.cush_marks = deque()                                     # (fed, cum_pcr), popped as released
         self.pmt_pid = None
+        self.audio_pids = ()                                         # PMT order = ffmpeg's 0:a:N order
         self.video = TrackHoles()
         self.audio = TrackHoles()
         self.holes_lock = threading.Lock()
@@ -648,18 +668,20 @@ class TsParser:
         if section[0] != 0x02 or stop < 12:
             return
         j = 12 + ((section[10] & 0x0F) << 8 | section[11])
-        video = audio = None
+        video = None
+        audio_pids = []
         while j + 5 <= stop:
             pid = (section[j + 1] & 0x1F) << 8 | section[j + 2]
             info = (section[j + 3] & 0x0F) << 8 | section[j + 4]
             if video is None and section[j] in VIDEO_STREAM_TYPES:
                 video = pid
-            elif audio is None and carries_audio(section[j], section, j + 5, min(j + 5 + info, stop)):
-                audio = pid
+            if carries_audio(section[j], section, j + 5, min(j + 5 + info, stop)):
+                audio_pids.append(pid)
             j += 5 + info
         with self.holes_lock:
+            self.audio_pids = tuple(audio_pids)
             self.video.adopt(video)
-            self.audio.adopt(audio)
+            self.audio.adopt(audio_pids[0] if audio_pids else None)
 
     def _pes(self, buf_, start, end, track, pusi):
         if pusi:
@@ -817,6 +839,19 @@ class Reservoir:
             while (self.bytes < min_bytes and not self.eof
                    and time.monotonic() - t0 < max_s and not self.stop.is_set()):
                 self.cond.wait(0.5)
+
+    def snapshot(self, max_bytes):
+        """Copy at most the first max_bytes without consuming the reservoir.
+        Used only by the opt-in startup audio probe, before release begins."""
+        with self.cond:
+            left = max_bytes
+            parts = []
+            for chunk in self.chunks:
+                if left <= 0:
+                    break
+                parts.append(chunk[:left])
+                left -= len(parts[-1])
+            return b"".join(parts)
 
     def take_dry(self, min_spell):
         """Seconds it sat empty since the last call, in spells of at least
@@ -1295,9 +1330,10 @@ class Upstream:
             self.ingest(d)
 
 
-def stderr_watcher(ff, on_corrupt):
-    """Relay ffmpeg stderr (Dispatcharr's logger reads ours) and hand every
-    `Packet corrupt` dts to on_corrupt (the corrupt-loop detector)."""
+def stderr_watcher(ff, on_corrupt, on_audio_discontinuity=None):
+    """Relay ffmpeg stderr (Dispatcharr's logger reads ours), hand every
+    `Packet corrupt` dts to the corrupt-loop detector, and optionally count
+    only audio-input timestamp discontinuities for live track selection."""
     pat = re.compile(rb"Packet corrupt \(stream = \d+, dts = (\d+)\)")
 
     def relay(raw):
@@ -1310,6 +1346,8 @@ def stderr_watcher(ff, on_corrupt):
         m = pat.search(raw)
         if m:
             on_corrupt(int(m.group(1)))
+        if on_audio_discontinuity and AUDIO_DISCONTINUITY_RE.search(raw):
+            on_audio_discontinuity()
 
     pending = b""
     while True:
@@ -1503,6 +1541,109 @@ def announce_audio_track():
         log(f"selecting source audio track {AUDIO_TRACK} (ffmpeg map 0:a:{AUDIO_TRACK - 1})")
 
 
+def audio_probe_errors(snapshot, track):
+    """Audio timestamp discontinuities on one track in the same initial TS
+    snapshot. Video stays mapped because the real failure is the demuxer's
+    alternating correction between the video clock and a far-away audio clock.
+    None means the finite probe could not evaluate this track safely."""
+    cmd = [
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
+        "-analyzeduration", "1000000", "-probesize", "500000",
+        "-i", "pipe:0", "-map", "0:v:0", "-map", f"0:a:{track - 1}",
+        "-c:v", "copy", *AUDIO_ARGS[AUDIO_CODEC], "-f", "null", "-",
+    ]
+    try:
+        run = subprocess.run(cmd, input=snapshot, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             timeout=AUDIO_PROBE_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if run.returncode:
+        return None
+    return len(AUDIO_DISCONTINUITY_RE.findall(run.stderr))
+
+
+class AudioTrackSelector:
+    """Opt-in source-track failover. A valid RESV_AUDIO_TRACK is an explicit
+    instruction and disables both automatic paths. Startup probes a copy of the
+    prefill, so it consumes no live bytes. Live failover asks the pump to retire
+    ffmpeg and start a new one on the next PMT audio track."""
+
+    def __init__(self):
+        self.current = AUDIO_TRACK
+        self.forced = AUDIO_TRACK_FORCED
+        self.start_errors = 0 if self.forced else AUDIO_START_ERRORS
+        self.live_errors = 0 if self.forced else AUDIO_LIVE_ERRORS
+        self.live_enabled = self.live_errors > 0
+        self.errors = 0
+        self.bad = set()
+        self.count = 1
+        self.switch = threading.Event()
+        self.lock = threading.Lock()
+
+    def choose_start(self, snapshot, count):
+        self.count = max(1, count)
+        if not self.start_errors or self.count < 2:
+            if self.start_errors and self.count < 2:
+                log("startup audio probe: the initial PMT exposes fewer than two audio tracks; keeping track 1")
+            return self.current
+        for track in range(1, self.count + 1):
+            errors = audio_probe_errors(snapshot, track)
+            if errors is None:
+                log(f"startup audio probe could not evaluate track {track}; keeping track 1")
+                self.current = 1
+                self.bad.clear()
+                return self.current
+            log(f"startup audio probe: track {track} has {errors} audio timestamp discontinuities "
+                f"(threshold {self.start_errors})")
+            if errors < self.start_errors:
+                self.current = track
+                if track != 1:
+                    log(f"startup audio probe selected track {track} (ffmpeg map 0:a:{track - 1})")
+                return self.current
+            self.bad.add(track)
+        self.current = 1
+        log(f"startup audio probe: all {self.count} tracks reached {self.start_errors} discontinuities; "
+            "falling back to track 1")
+        return self.current
+
+    def on_discontinuity(self):
+        with self.lock:
+            if not self.live_enabled or self.switch.is_set():
+                return
+            self.errors += 1
+            if self.errors >= self.live_errors:
+                self.switch.set()
+
+    def take_switch(self, count):
+        """Return the next track after the live threshold, None to keep the
+        current ffmpeg. Every track is tried at most once; when all are bad the
+        selector returns to track 1 and disables itself to avoid a restart loop."""
+        with self.lock:
+            if not self.switch.is_set():
+                return None
+            self.count = max(self.count, count, 1)
+            failed = self.current
+            self.bad.add(failed)
+            order = list(range(failed + 1, self.count + 1)) + list(range(1, failed))
+            candidates = [track for track in order if track not in self.bad]
+            self.switch.clear()
+            self.errors = 0
+            if candidates:
+                self.current = candidates[0]
+                log(f"audio track {failed} reached {self.live_errors} timestamp discontinuities; "
+                    f"switching live to track {self.current} (ffmpeg map 0:a:{self.current - 1})")
+                return self.current
+            self.live_enabled = False
+            if self.current != 1:
+                self.current = 1
+                log(f"all {self.count} audio tracks reached the live threshold; returning to track 1 "
+                    "and disabling automatic live switching")
+                return self.current
+            log(f"all {self.count} audio tracks reached the live threshold; staying on track 1 "
+                "and disabling automatic live switching")
+            return None
+
+
 class Stream:
     """One tune: Upstream fills the Reservoir, pump() releases it to ffmpeg
     through the Pacer, and the watchers on both ends run beside it."""
@@ -1513,6 +1654,7 @@ class Stream:
         self.reservoir = Reservoir(self.stop)
         self.upstream = Upstream(url, ua, self.reservoir, self.parser, self.stop)
         self.detector = CorruptionDetector()
+        self.active_ff = None
 
     def shutdown(self):
         self.stop.set()
@@ -1531,53 +1673,98 @@ class Stream:
         silent = time.monotonic() - self.upstream.last_arrival
         return silent if silent >= max(DRY_EXIT_S, 2 * self.parser.chunk_s()) else None
 
-    def watch_ffmpeg(self, ff):
+    def watch_ffmpeg(self, ff, retiring=None, selector=None):
         """Relay ffmpeg's stderr until it closes, i.e. until ffmpeg is gone. If
         nothing asked it to go (OOM kill, crash), end the stream: with the
         reservoir empty nothing writes to its stdin, so the dead pipe went
         unnoticed and the channel sat on dead air instead of ending, which is
         what lets Dispatcharr retry or fail over."""
-        stderr_watcher(ff, self.upstream.register_corrupt)
-        if self.stop.is_set():
+        retiring = retiring or threading.Event()
+        stderr_watcher(ff, self.upstream.register_corrupt,
+                       selector.on_discontinuity if selector else None)
+        if self.stop.is_set() or retiring.is_set():
             return
         try:
             rc = ff.wait(timeout=5)
         except subprocess.TimeoutExpired:
             return
-        if self.stop.is_set():
+        if self.stop.is_set() or retiring.is_set():
             return
         log(f"ffmpeg exited on its own (rc={rc}); shutting down")
         self.shutdown()
+
+    def start_ffmpeg(self, track, timeline, selector):
+        offset = output_ts_offset(timeline, time.time())
+        ff = subprocess.Popen(ffmpeg_cmd(offset, track), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE if timeline else None, stderr=subprocess.PIPE, bufsize=0)
+        self.active_ff = ff
+        retiring = threading.Event()
+        threading.Thread(target=self.watch_ffmpeg, args=(ff, retiring, selector), daemon=True).start()
+        relay = None
+        if timeline:
+            if TS_CHANNEL:
+                log(f"ts timeline: channel {TS_CHANNEL} starts at {timeline.origin:.3f}s "
+                    f"(output offset {timeline.offset:.3f}s)")
+            else:
+                log(f"live audio-switch timeline starts at {timeline.origin:.3f}s "
+                    f"(output offset {timeline.offset:.3f}s)")
+            relay = threading.Thread(target=stdout_relay, args=(ff, timeline), daemon=True)
+            relay.start()
+        elif offset is not None:
+            log(f"output timestamps start on the wall clock (offset {offset:.3f}s)")
+        return ff, retiring, relay
+
+    def retire_ffmpeg(self, ff, retiring, relay, drain=False):
+        retiring.set()
+        try:
+            ff.stdin.close()
+        except Exception:
+            pass
+        if drain:
+            try:
+                ff.wait(timeout=RELAY_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                pass
+        if ff.poll() is None:
+            try:
+                ff.terminate()
+                ff.wait(timeout=5)
+            except Exception:
+                try:
+                    ff.kill()
+                except Exception:
+                    pass
+        if relay:
+            relay.join(timeout=RELAY_DRAIN_S)
+        if self.active_ff is ff:
+            self.active_ff = None
 
     def run(self):
         threading.Thread(target=self.upstream.run, daemon=True).start()
 
         t0 = time.monotonic()
-        self.reservoir.wait_prefill(PREFILL_BYTES, PREFILL_MAX_S)
+        prefill_target = (max(PREFILL_BYTES, AUDIO_PROBE_BYTES)
+                          if AUDIO_START_ERRORS and not AUDIO_TRACK_FORCED else PREFILL_BYTES)
+        self.reservoir.wait_prefill(prefill_target, PREFILL_MAX_S)
         if self.reservoir.eof and not self.reservoir.bytes:
             log(f"no data before the fetcher gave up ({time.monotonic() - t0:.1f}s); exiting without ffmpeg")
             return
         log(f"prefill done: {self.reservoir.bytes / 1e6:.1f}MB in {time.monotonic() - t0:.1f}s, "
             f"releasing stream to ffmpeg")
 
-        timeline = Timeline(timeline_path(), time.time()) if TS_CHANNEL else None
-        offset = output_ts_offset(timeline, time.time())
-        ff = subprocess.Popen(ffmpeg_cmd(offset), stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE if timeline else None, stderr=subprocess.PIPE, bufsize=0)
-        threading.Thread(target=self.watch_ffmpeg, args=(ff,), daemon=True).start()
-        relay = None
-        if timeline:
-            log(f"ts timeline: channel {TS_CHANNEL} starts at {timeline.origin:.3f}s "
-                f"(output offset {timeline.offset:.3f}s)")
-            relay = threading.Thread(target=stdout_relay, args=(ff, timeline), daemon=True)
-            relay.start()
-        elif offset is not None:
-            log(f"output timestamps start on the wall clock (offset {offset:.3f}s)")
+        selector = AudioTrackSelector()
+        if selector.start_errors:
+            selector.choose_start(self.reservoir.snapshot(AUDIO_PROBE_BYTES), len(self.parser.audio_pids))
+        timeline = (Timeline(timeline_path(), time.time()) if TS_CHANNEL else
+                    Timeline(None, time.time()) if selector.live_enabled else None)
         if STALL_S > 0:
             threading.Thread(target=self.upstream.stall_watchdog, daemon=True).start()
 
         def on_term(signum, frame):
             self.shutdown()
+            ff = self.active_ff
+            if ff is None:
+                return
             try:
                 ff.stdin.close()
             except Exception:
@@ -1589,8 +1776,26 @@ class Stream:
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
 
+        pacer = Pacer(self.parser, self.reservoir)
+        last_rc = None
+        retiring = None
+        relay = None
         try:
-            self.pump(ff, timeline)
+            while not self.stop.is_set():
+                ff, retiring, relay = self.start_ffmpeg(selector.current, timeline, selector)
+                reason, next_track = self.pump(ff, timeline, pacer, selector)
+                self.retire_ffmpeg(ff, retiring, relay, drain=reason == "audio-switch")
+                last_rc = ff.returncode
+                if timeline:
+                    timeline.save(time.time())
+                    if timeline.rejected:
+                        log(f"ts timeline: ignored {timeline.rejected} output PTS more than "
+                            f"{TS_MAX_LEAD_S:.0f}s ahead of the wall clock")
+                if reason != "audio-switch" or self.stop.is_set():
+                    break
+                if timeline:
+                    timeline = Timeline(timeline_path() if TS_CHANNEL else None, time.time(), after=timeline.end())
+                log(f"restarting ffmpeg on source audio track {next_track}")
         except (BrokenPipeError, OSError) as e:
             log(f"stream consumer gone ({type(e).__name__}); shutting down")
         except ValueError:
@@ -1604,43 +1809,33 @@ class Stream:
             log("shutdown during write (ff.stdin closed by signal handler)")
         finally:
             self.shutdown()
-            try:
-                ff.stdin.close()
-            except Exception:
-                pass
-            try:
-                ff.terminate()
-                ff.wait(timeout=5)
-            except Exception:
-                try:
-                    ff.kill()
-                except Exception:
-                    pass
-            if relay:
-                relay.join(timeout=RELAY_DRAIN_S)
-            if timeline:
-                timeline.save(time.time())
-                if timeline.rejected:
-                    log(f"ts timeline: ignored {timeline.rejected} output PTS more than "
-                        f"{TS_MAX_LEAD_S:.0f}s ahead of the wall clock")
-            log(f"stream wrapper exit (ffmpeg rc={ff.returncode})")
+            ff = self.active_ff
+            if ff is not None:
+                self.retire_ffmpeg(ff, retiring or threading.Event(), relay)
+                last_rc = ff.returncode
+            log(f"stream wrapper exit (ffmpeg rc={last_rc})")
 
-    def pump(self, ff, timeline):
+    def pump(self, ff, timeline, pacer=None, selector=None):
         """Release the reservoir to ffmpeg's stdin at the content rate, and log
         the telemetry line every STATS_EVERY_S - also while the reservoir is
         dry, when the cushion it reports is the one thing worth knowing. Returns
         once the fetcher has ended, or once the upstream has been down too long
         with nothing left to release (dry_exit_due)."""
-        pacer = Pacer(self.parser, self.reservoir)
+        pacer = pacer or Pacer(self.parser, self.reservoir)
+        selector = selector or AudioTrackSelector()
         delivered = False
         told_staying = False
         out_since_stats = 0
         last_stats = time.monotonic()
         tail = b""                                                    # see align_to_188(): ffmpeg expects 188-aligned writes
         while not self.stop.is_set():
+            if selector.switch.is_set():
+                next_track = selector.take_switch(len(self.parser.audio_pids))
+                if next_track is not None:
+                    return "audio-switch", next_track
             d, released_total = self.reservoir.take(timeout=0.5)
             if d is None:
-                break
+                return "end", None
             level = pacer.measure(released_total)
             if d:
                 pacer.pace(len(d), level)
@@ -1670,6 +1865,7 @@ class Stream:
                 self.report(level, out_since_stats / (now - last_stats))
                 out_since_stats = 0
                 last_stats = now
+        return "end", None
 
     def report(self, level, orate):
         p, res = self.parser, self.reservoir
@@ -1700,6 +1896,12 @@ def main():
     if FLOOR_REQUESTED and not FLOOR_OK:
         log(f"RESV_FLOOR={FLOOR_REQUESTED!r} is not a decimal above 0 and at most 1 (e.g. 0.97); "
             f"releasing the stream at no less than realtime (1.0)")
+    if not AUDIO_START_ERRORS_OK:
+        log(f"RESV_AUDIO_START_ERRORS={AUDIO_START_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
+    if not AUDIO_LIVE_ERRORS_OK:
+        log(f"RESV_AUDIO_LIVE_ERRORS={AUDIO_LIVE_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
+    if AUDIO_TRACK_FORCED and (AUDIO_START_ERRORS or AUDIO_LIVE_ERRORS):
+        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK} is forced; automatic startup and live audio selection ignored")
     announce_audio_codec()
     announce_audio_track()
     Stream(URL, UA).run()
