@@ -33,7 +33,8 @@ reap ffmpeg; on SIGKILL the broken pipes make ffmpeg exit on its own.
 
 Layout: a Stream owns one tune. Its Upstream (fetcher thread) cuts each
 connection into whole TS packets (PacketAligner), passes them through the
-optional ReplaySkip gate into the Reservoir and the TsParser; Stream.pump()
+optional reconnect ReplaySkip and in-connection RewindSkip gates into the
+Reservoir and the TsParser; Stream.pump()
 takes them out through the Pacer into ffmpeg's stdin. The stall watchdog,
 the corrupt-loop watcher on ffmpeg's stderr and the #5 CorruptionDetector
 ask the Upstream to reconnect. An outage that outlasts the reservoir ends the
@@ -137,6 +138,9 @@ AUDIO_PROBE_TIMEOUT_S = 5.0
 AUDIO_DISCONTINUITY_RE = re.compile(rb"\[aist#0:\d+/[^\]]+\].*timestamp discontinuity")
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
+REWIND_SKIP = os.getenv("RESV_REWIND_SKIP", "0") == "1"
+REWIND_MAX_S = float(os.getenv("RESV_REWIND_MAX_S", "60"))
+REWIND_RECONNECT = os.getenv("RESV_REWIND_RECONNECT", "0") == "1"
 REPLAY_HOLD_BYTES = 1024 * 1024
 REPLAY_MIN_CUSHION_S = 3.0
 REPLAY_STEP_MAX_S = 10.0
@@ -995,6 +999,201 @@ class ReplaySkip:
         return b""
 
 
+class RewindSkip:
+    """RESV_REWIND_SKIP: detect a PCR rewind inside one HTTP connection and
+    hold the suspect packets until their clock passes the last PCR already
+    admitted. A confirmed overlap is dropped; every ambiguous or unsafe case
+    is fail-open, so it may repeat but cannot create an input outage."""
+
+    def __init__(self, parser, reservoir, reconnect=None):
+        self.parser = parser
+        self.reservoir = reservoir
+        self.reconnect = reconnect
+        self.on_reconnect()
+
+    def on_reconnect(self):
+        self.pcr_pid = self.last_pcr = None
+        self.reject_run = 0
+        self.bypass = False
+        self.ignore_parser_anchor = None
+        self._clear_hold()
+
+    def _clear_hold(self):
+        self.seam = None
+        self.held = bytearray()
+        self.scan = self.first = self.prev = None
+        self.advanced_at = 0
+        self.marked_discontinuity = False
+
+    def discard_held(self):
+        """A flushing reconnect discards this gate's bytes with the reservoir."""
+        self._clear_hold()
+        self.bypass = True
+
+    def _release(self, reason):
+        out = bytes(self.held)
+        self._clear_hold()
+        self.bypass = True                                            # one fail-open only; retry on the next connection
+        log(f"rewind in connection: {reason}; passing through", stderr=False)
+        return out
+
+    def release_held(self):
+        if self.seam is None or not self.held:
+            return b""
+        return self._release("connection ended before the seam")
+
+    def running_low(self):
+        crate = self.parser.content_rate()
+        return crate is not None and self.reservoir.bytes < crate * REPLAY_MIN_CUSHION_S
+
+    def available_cushion(self):
+        """Conservative seconds currently available while ingest is held. The
+        parser's PCR cushion and the reservoir totals are owned by different
+        threads; bytes/current content-rate is sufficient for this admission
+        decision and cannot overstate safety after a bitrate increase."""
+        crate = self.parser.content_rate()
+        return None if crate is None else self.reservoir.bytes / crate
+
+    def sync_parser_anchor(self):
+        """Use the exact PCR anchor that will parse these bytes next. Keeping a
+        second independent clock let the gate and TsParser diverge on a source
+        with several legal discontinuities: the parser then reported pcr_back
+        even though the upstream gate saw none. A deliberately accepted jump
+        beyond REWIND_MAX_S temporarily owns its new anchor until TsParser has
+        moved off the old one."""
+        p = self.parser
+        if p.pcr_pid is None or p.last_pcr is None:
+            return
+        if self.ignore_parser_anchor is not None:
+            if p.last_pcr == self.ignore_parser_anchor:
+                return
+            self.ignore_parser_anchor = None
+        self.pcr_pid = p.pcr_pid
+        self.last_pcr = p.last_pcr
+
+    def _hold(self, data, i, pid, seam, first, marked_discontinuity=False):
+        """Keep the packet carrying the first backward PCR and everything
+        after it. Bytes before that packet are known-good and can enter the
+        reservoir immediately."""
+        self.seam = (pid, seam)
+        self.held = bytearray(data[i:])
+        self.scan = 188                                               # packet zero supplied `first`
+        self.first = self.prev = first
+        self.advanced_at = 0
+        self.marked_discontinuity = marked_discontinuity
+        behind = (seam - first) % TS_WRAP_S
+        cushion = self.available_cushion()
+        if cushion is not None and cushion < behind + REPLAY_MIN_CUSHION_S:
+            if REWIND_RECONNECT and self.reconnect and self.reconnect(behind, cushion):
+                self._clear_hold()                                    # suspect tail is replaced by the fresh connection
+                self.bypass = True
+                return data[:i]
+            return data[:i] + self._release(
+                f"only {cushion:.1f}s cushion for a {behind:.1f}s rewind")
+        if self.reservoir.bytes + len(self.held) > MAX_BYTES:
+            return data[:i] + self._release("rewind does not fit in the reservoir")
+        if self.running_low():
+            return data[:i] + self._release("reservoir running low")
+        return data[:i]
+
+    def _feed_held(self, data):
+        held = self.held
+        held.extend(data)
+        if self.reservoir.bytes + len(held) > MAX_BYTES:
+            return self._release("rewind does not fit in the reservoir")
+        if self.running_low():
+            return self._release("reservoir running low")
+        pid_seam, seam = self.seam
+        i = self.scan
+        while i + 188 <= len(held):
+            if i - self.advanced_at > REPLAY_HOLD_BYTES:
+                return self._release("no PCR within the hold limit"
+                                     if self.first is None else "PCR not advancing through the rewind")
+            if held[i] != 0x47:
+                return self._release("lost TS sync")
+            found = packet_pcr(held, i)
+            if found and found[0] == pid_seam:
+                _, pcr, disc = found
+                if disc:
+                    return self._release("discontinuity flag")
+                step = (pcr - self.prev) % TS_WRAP_S
+                if step > REPLAY_STEP_MAX_S:
+                    return self._release("PCR not advancing through the rewind")
+                if step > 0:
+                    self.prev = pcr
+                    self.advanced_at = i
+                ahead = (pcr - seam) % TS_WRAP_S
+                if 0 < ahead < TS_WRAP_S / 2:
+                    skipped = (seam - self.first) % TS_WRAP_S
+                    dropped = i
+                    marked = self.marked_discontinuity
+                    out = bytes(held[i:])                             # retain the first packet past the seam
+                    self._clear_hold()
+                    self.last_pcr = seam
+                    self.reject_run = 0
+                    log(f"rewind in connection: skipped {skipped:.1f}s "
+                        f"({dropped / 1e6:.1f}MB) already delivered"
+                        f"{' (source discontinuity flag)' if marked else ''}", stderr=False)
+                    return self.feed(out)                             # observe the retained tail and catch a second rewind
+            i += 188
+        self.scan = i
+        return b""
+
+    def feed(self, data):
+        if not REWIND_SKIP or self.bypass:
+            return data
+        if self.seam is not None:
+            return self._feed_held(data)
+        self.sync_parser_anchor()
+        i = 0
+        while i + 188 <= len(data):
+            if data[i] != 0x47:
+                i += 188                                             # do not let an earlier bad packet disable a later real rewind
+                continue                                             # shifted input simply yields no PCR and stays fail-open
+            found = packet_pcr(data, i)
+            if found:
+                pid, pcr, disc = found
+                if self.pcr_pid is None:
+                    self.pcr_pid = pid
+                    self.last_pcr = pcr
+                elif pid == self.pcr_pid:
+                    if self.last_pcr is None:
+                        self.last_pcr = pcr
+                    elif pcr != self.last_pcr:
+                        raw = pcr - self.last_pcr
+                        if -TS_WRAP_S / 2 < raw < -0.5:
+                            behind = (self.last_pcr - pcr) % TS_WRAP_S
+                            if behind <= REWIND_MAX_S:
+                                # Some sources explicitly mark their overlap-replay as a
+                                # legal discontinuity. The opt-in gate still verifies that
+                                # the clock reaches the old seam before dropping anything.
+                                return self._hold(data, i, pid, self.last_pcr, pcr, disc)
+                            # This is probably a real clock reset. Admit and re-anchor it,
+                            # but keep watching: the same connection may later carry a
+                            # smaller overlap that is inside the configured limit.
+                            log(f"rewind in connection: {behind:.1f}s backward jump"
+                                f"{' with source discontinuity flag' if disc else ''} is beyond "
+                                "RESV_REWIND_MAX_S; re-anchored and passing through", stderr=False)
+                            self.ignore_parser_anchor = self.last_pcr
+                            self.last_pcr = pcr
+                            self.reject_run = 0
+                        elif disc:
+                            self.last_pcr = pcr
+                            self.reject_run = 0
+                        else:
+                            delta = (pcr - self.last_pcr) % TS_WRAP_S
+                            if 0.0 < delta < REPLAY_STEP_MAX_S:
+                                self.last_pcr = pcr
+                                self.reject_run = 0
+                            else:
+                                self.reject_run += 1
+                                if self.reject_run > 25:
+                                    self.last_pcr = pcr
+                                    self.reject_run = 0
+            i += 188
+        return data
+
+
 class PacketAligner:
     """Cuts one upstream connection into whole TS packets, so everything in
     the reservoir starts on a packet boundary. align_to_188() on the write side
@@ -1129,6 +1328,7 @@ class Upstream:
         self.parser = parser
         self.stop = stop
         self.replay = ReplaySkip(parser, reservoir)
+        self.rewind = RewindSkip(parser, reservoir, self.reconnect_for_rewind)
         self.lock = threading.Lock()                                  # guards the request fields below
         self.force = threading.Event()                                # a reconnect has been requested
         self.flush_pending = False                                    # sticky flush request: set by a flush caller, cleared by the fetcher after it flushes
@@ -1137,6 +1337,7 @@ class Upstream:
         # reconnect then.
         self.last_forced_flush = float("-inf")                        # corrupt-loop / #5 debounce (flush=True)
         self.last_forced_stall = float("-inf")                        # stall watchdog #4 debounce (flush=False)
+        self.last_forced_rewind = float("-inf")                       # optional low-cushion rewind reconnect
         self.response = None                                          # live urllib response (for a forced abort)
         self.corrupt_seen = deque()                                   # (monotonic ts, dts) from ffmpeg stderr
         self.arrived_total = 0                                        # bytes off the wire, held replay and dropped partials included
@@ -1145,12 +1346,20 @@ class Upstream:
         self.reconnects = 0
         self.backoff = 1
 
-    def request_reconnect(self, reason, flush=True):
+    def reconnect_for_rewind(self, behind, cushion):
+        return self.request_reconnect(
+            f"rewind in connection: only {cushion:.1f}s cushion for {behind:.1f}s replay - "
+            "reconnecting upstream, buffer kept",
+            flush=False, rewind=True)
+
+    def request_reconnect(self, reason, flush=True, rewind=False):
         """Forced reconnect shared by the corrupt-loop / #5 detectors (flush=True —
-        buffer is poisoned) and the stall watchdog (#4, flush=False — buffer is good).
-        Debounced PER CLASS (<=1 per 90s each) so a benign stall can never rate-limit
-        away a corrupt flush; the flush request is sticky and is never downgraded by a
-        concurrent no-flush. Returns True if it fired, False if rate-limited."""
+        buffer is poisoned), the stall watchdog and the optional rewind fallback
+        (flush=False — buffer is good). Debounced PER CLASS (<=1 per 90s each) so
+        a rewind attempt cannot rate-limit away the stall watchdog, and neither
+        can rate-limit away a corrupt flush; the flush request is sticky and is
+        never downgraded by a concurrent no-flush. Returns True if it fired,
+        False if rate-limited."""
         now = time.monotonic()
         with self.lock:
             if flush:
@@ -1159,9 +1368,15 @@ class Upstream:
                 self.last_forced_flush = now
                 self.flush_pending = True                             # sticky; the fetcher clears it after flushing
             else:
-                if now - self.last_forced_stall <= 90:
+                anchor = self.last_forced_rewind if rewind else self.last_forced_stall
+                if now - anchor <= 90:
                     return False
-                self.last_forced_stall = now                          # leave flush_pending alone (never downgrade a flush)
+                if rewind:
+                    self.last_forced_rewind = now
+                else:
+                    self.last_forced_stall = now
+                # Leave flush_pending alone: neither no-flush caller may
+                # downgrade a concurrent corrupt-loop flush.
             self.force.set()
             # Taken under the lock with the request: once force is set, the next
             # connection the fetcher publishes is the answer to this request, and
@@ -1250,6 +1465,7 @@ class Upstream:
                 with self.lock:
                     self.response = r
                 self.replay.arm(allowed=not flushed)
+                self.rewind.on_reconnect()
                 self.parser.on_reconnect()
                 log(f"upstream connected edge={edge_of(r.geturl())}")
                 if not first:
@@ -1260,9 +1476,15 @@ class Upstream:
                 log(f"upstream error {type(e).__name__}: {e}; retry in {self.retry_wait()}s")
             if self.stop.is_set():
                 break
-            held = b"" if self.flush_requested else self.replay.release_held()
-            if held:
-                self.ingest(held)
+            if self.flush_requested:
+                self.rewind.discard_held()
+            else:
+                held = self.replay.release_held()
+                if held:
+                    self.pass_rewind(held)
+                held = self.rewind.release_held()
+                if held:
+                    self.ingest(held)
             if self.arrived_total == 0:
                 tries_without_data += 1
                 if GIVEUP_TRIES and tries_without_data >= GIVEUP_TRIES:
@@ -1342,6 +1564,11 @@ class Upstream:
     def pass_on(self, d):
         if d:
             d = self.replay.feed(d)
+        if d:
+            self.pass_rewind(d)
+
+    def pass_rewind(self, d):
+        d = self.rewind.feed(d)
         if d:
             self.ingest(d)
 
@@ -1945,6 +2172,12 @@ def main():
         log(f"{action} output audio by {abs(AUDIO_OFFSET_MS)}ms (RESV_AUDIO_OFFSET_MS={AUDIO_OFFSET_MS})")
     if AUDIO_TRACK_FORCED and (AUDIO_START_ERRORS or AUDIO_LIVE_ERRORS):
         log(f"RESV_AUDIO_TRACK={AUDIO_TRACK} is forced; automatic startup and live audio selection ignored")
+    if REWIND_SKIP:
+        log(f"in-connection rewind skip enabled (RESV_REWIND_MAX_S={REWIND_MAX_S:g})")
+    if REWIND_RECONNECT and REWIND_SKIP:
+        log("low-cushion rewind reconnect enabled (RESV_REWIND_RECONNECT=1)")
+    elif REWIND_RECONNECT:
+        log("RESV_REWIND_RECONNECT=1 ignored because RESV_REWIND_SKIP=0")
     announce_audio_codec()
     announce_audio_track()
     Stream(URL, UA).run()

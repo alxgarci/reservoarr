@@ -212,6 +212,8 @@ Three watchdogs ride alongside (and if ffmpeg dies on its own, the stream ends s
 
 When an outage outlasts the cushion, the process exits (`RESV_DRY_EXIT_S`, once per URL per 31 minutes) so Dispatcharr retries or fails over at once. A process still waiting for its first byte stays.
 
+Two separate default-off gates can remove content the provider sends twice. `RESV_REPLAY_SKIP=1` handles overlap immediately after an HTTP reconnect; `RESV_REWIND_SKIP=1` handles PCR moving backwards while that same connection remains open, including when the source marks it with `discontinuity_indicator` (`disc` rises while `pcr_back` stays zero). Both require enough buffered content to cover what they discard and fail open if the seam is ambiguous or the reservoir approaches starvation. `RESV_REWIND_RECONNECT=1` is the explicit alternative when an in-connection replay is longer than the cushion: try a fresh upstream connection while keeping the good buffer. Use the surrounding `upstream connected` lines to choose the right path; see [docs/TUNABLES.md](docs/TUNABLES.md).
+
 Deeper reading:
 
 - [docs/INVARIANTS.md](docs/INVARIANTS.md) — the rules anyone editing the script must respect, with the production failure each one is earned by.
