@@ -2,6 +2,12 @@
 
 All notable changes to `reservoarr.py`. Each version's invariants are earned by a real production failure — read this before changing the script.
 
+## [Unreleased]
+
+- **New default-off `RESV_AUDIO_TRACK` source-track selector.** It is a positive, 1-based track number: `RESV_AUDIO_TRACK=3` maps `0:a:2`, while an unset value keeps the previous `0:a:0` command byte for byte. Invalid values log once and fall back to track 1; a missing source index remains a loud ffmpeg startup failure rather than silently producing video without audio. This reopens the selector deliberately deferred in 6.3.10: a live six-audio-track TS was observed with its first two AC-3 tracks about 6,000 seconds away from the video timeline, making ffmpeg alternate `timestamp discontinuity` corrections on every audio/video packet and Plex stutter, while the third audio track was aligned and carried the desired programme.
+
+- `tests/unit/test_audio_track.py` covers the unchanged default, 1-based mapping, validation and timeline-offset command. `docs/TUNABLES.md` documents per-profile use.
+
 ## [6.7.0] — 2026-10-31
 
 Reservoarr now hands an outage back to Dispatcharr by itself, restarts no longer send timestamps back to the start, and the stats line shows the holes the 15s averages hide. Nothing to configure ([@sm0keb0x](https://github.com/sm0keb0x), [discussion #46](https://github.com/brko7/reservoarr/discussions/46)).

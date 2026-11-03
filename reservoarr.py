@@ -109,6 +109,9 @@ AUDIO_ARGS = {
 AUDIO_CODEC_REQUESTED = os.getenv("RESV_AUDIO_CODEC", "ac3").strip().lower()
 AUDIO_CODEC = AUDIO_CODEC_REQUESTED if AUDIO_CODEC_REQUESTED in AUDIO_ARGS else "ac3"
 AUDIO_FILL_GAPS = os.getenv("RESV_AUDIO_FILL_GAPS", "0") == "1"
+AUDIO_TRACK_REQUESTED = os.getenv("RESV_AUDIO_TRACK", "").strip()
+AUDIO_TRACK_OK = re.fullmatch(r"[1-9][0-9]*", AUDIO_TRACK_REQUESTED, re.ASCII) is not None
+AUDIO_TRACK = int(AUDIO_TRACK_REQUESTED) if AUDIO_TRACK_OK else 1       # user-facing track number, starts at 1
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
 REPLAY_HOLD_BYTES = 1024 * 1024
@@ -146,7 +149,7 @@ FFMPEG_CMD = [
     *(["-stats"] if FFMPEG_STATS else []),
     "-analyzeduration", "1000000", "-probesize", "500000",
     "-i", "pipe:0",
-    "-map", "0:v", "-map", "0:a:0",
+    "-map", "0:v", "-map", f"0:a:{AUDIO_TRACK - 1}",
     "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
     *AUDIO_ARGS[AUDIO_CODEC],
     *(["-af", "aresample=async=1"] if AUDIO_FILL_GAPS else []),
@@ -1492,6 +1495,14 @@ def announce_audio_codec():
             f"encoding audio as {AUDIO_CODEC}")
 
 
+def announce_audio_track():
+    if AUDIO_TRACK_REQUESTED and not AUDIO_TRACK_OK:
+        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK_REQUESTED!r} is not a positive track number (e.g. 3); "
+            "selecting source audio track 1")
+    elif AUDIO_TRACK != 1:
+        log(f"selecting source audio track {AUDIO_TRACK} (ffmpeg map 0:a:{AUDIO_TRACK - 1})")
+
+
 class Stream:
     """One tune: Upstream fills the Reservoir, pump() releases it to ffmpeg
     through the Pacer, and the watchers on both ends run beside it."""
@@ -1690,6 +1701,7 @@ def main():
         log(f"RESV_FLOOR={FLOOR_REQUESTED!r} is not a decimal above 0 and at most 1 (e.g. 0.97); "
             f"releasing the stream at no less than realtime (1.0)")
     announce_audio_codec()
+    announce_audio_track()
     Stream(URL, UA).run()
 
 
