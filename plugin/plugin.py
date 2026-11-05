@@ -98,7 +98,7 @@ class Plugin:
                                "To override (cushion target, watchdog thresholds, audio language, "
                                "TS-corruption detector arming, etc.), create a separate stream "
                                "profile with command /usr/bin/env and parameters "
-                               "'RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent}'. "
+                               "'RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent} {channelId}'. "
                                "Variables set on the Dispatcharr container are NOT seen by the "
                                "script. Generate Stream Profile resets any profile of its name, so don't "
                                "edit that one. Full reference at the GitHub link.",
@@ -167,7 +167,7 @@ class Plugin:
         existing = StreamProfile.objects.filter(name__iexact=name).first()
         defaults = {
             "command": self.dst_script,
-            "parameters": "{streamUrl} {userAgent}",
+            "parameters": "{streamUrl} {userAgent} {channelId}",
             "is_active": True,
             "locked": False,
         }

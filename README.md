@@ -40,7 +40,7 @@ If you didn't set it as default in step 3, assign it per-channel: Channels → E
 
 That's it. Now [tune a channel](#first-channel-tune) to confirm it's working.
 
-> Tuning (cushion size, watchdog thresholds, log directory, audio language, etc.) uses `RESV_*` variables, but **not as container environment variables** — Dispatcharr starts its workers through `su -`, which clears them, so a variable set on the container (Docker, Unraid) is ignored. Put them in a stream profile: command `/usr/bin/env`, parameters `RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent}`. Create a separate profile for it; **Generate Stream Profile** resets the one it made. Defaults fit most providers, so override only with evidence. Full steps and the variable list: [docs/TUNABLES.md](docs/TUNABLES.md#where-settings-go).
+> Tuning (cushion size, watchdog thresholds, log directory, audio language, etc.) uses `RESV_*` variables, but **not as container environment variables** — Dispatcharr starts its workers through `su -`, which clears them, so a variable set on the container (Docker, Unraid) is ignored. Put them in a stream profile: command `/usr/bin/env`, parameters `RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent} {channelId}`. Create a separate profile for it; **Generate Stream Profile** resets the one it made. Defaults fit most providers, so override only with evidence. Full steps and the variable list: [docs/TUNABLES.md](docs/TUNABLES.md#where-settings-go).
 
 ### Option 2 — Vendored copy + manual Stream Profile
 
@@ -51,7 +51,7 @@ That's it. Now [tune a channel](#first-channel-tune) to confirm it's working.
    |---|---|
    | **Name** | `delay-buffer` |
    | **Command** | `/data/scripts/reservoarr.py` |
-   | **Parameters** | `{streamUrl} {userAgent}` |
+   | **Parameters** | `{streamUrl} {userAgent} {channelId}` |
    | **Active** | yes |
 
 3. Set it as the instance-wide default (Settings → Stream Settings → Default Stream Profile) or per-channel under Channels → Edit → Stream Profile.
@@ -84,7 +84,7 @@ The Stream Profile DB row can be created idempotently via Dispatcharr's `manage.
 ```python
 from core.models import StreamProfile, CoreSettings
 desired = {"command": "/data/scripts/reservoarr.py",
-           "parameters": "{streamUrl} {userAgent}", "is_active": True}
+           "parameters": "{streamUrl} {userAgent} {channelId}", "is_active": True}
 p, _ = StreamProfile.objects.get_or_create(name="delay-buffer", defaults=desired)
 for k, v in desired.items():
     setattr(p, k, v)
@@ -212,7 +212,7 @@ Three watchdogs ride alongside (and if ffmpeg dies on its own, the stream ends s
 
 When an outage outlasts the cushion, the process exits (`RESV_DRY_EXIT_S`, once per URL per 31 minutes) so Dispatcharr retries or fails over at once. A process still waiting for its first byte stays.
 
-Two separate default-off gates can remove content the provider sends twice. `RESV_REPLAY_SKIP=1` handles overlap immediately after an HTTP reconnect; `RESV_REWIND_SKIP=1` handles PCR moving backwards while that same connection remains open, including when the source marks it with `discontinuity_indicator` (`disc` rises while `pcr_back` stays zero). Both require enough buffered content to cover what they discard and fail open if the seam is ambiguous or the reservoir approaches starvation. `RESV_REWIND_RECONNECT=1` is the explicit alternative when an in-connection replay is longer than the cushion: try a fresh upstream connection while keeping the good buffer. Use the surrounding `upstream connected` lines to choose the right path; see [docs/TUNABLES.md](docs/TUNABLES.md).
+Two separate default-off gates can remove content the provider sends twice. `RESV_REPLAY_SKIP=1` handles overlap immediately after an HTTP reconnect; `RESV_REWIND_SKIP=1` handles PCR moving backwards while that same connection remains open, including when the source marks it with `discontinuity_indicator` (`disc` rises while `pcr_back` stays zero). The in-connection gate resynchronizes after corrupt TS bytes, holds the suspect burst outside the reservoir, and admits only the suffix whose PCR has advanced beyond the last point already admitted. Confirmed repeated bytes therefore do not inflate `cushion`, while bytes after the old seam do. It has no cushion threshold or maximum-rewind setting; ambiguous or oversized holds fail open. Use the surrounding `upstream connected` lines to choose the right gate; see [docs/TUNABLES.md](docs/TUNABLES.md).
 
 Deeper reading:
 

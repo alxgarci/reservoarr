@@ -83,3 +83,27 @@ def test_timeline_offset_keeps_the_selected_track(tmp_path):
 
     assert audio_map(cmd) == "0:a:2"
     assert cmd[-3:] == ["-output_ts_offset", "12.500000", "pipe:1"]
+
+
+def test_priority_skips_tracks_absent_from_the_stream(tmp_path, monkeypatch):
+    resv = load(tmp_path, RESV_AUDIO_TRACK="1,3,5", RESV_AUDIO_START_ERRORS="2")
+    checked = []
+
+    def probe(_snapshot, track):
+        checked.append(track)
+        return 2 if track == 1 else 0
+
+    monkeypatch.setattr(resv, "audio_probe_errors", probe)
+    selector = resv.AudioTrackSelector()
+
+    assert selector.choose_start(b"sample", count=3) == 3
+    assert checked == [1, 3]
+    assert "priority track 5 is absent; ignoring" in journal(resv)
+
+
+def test_priority_falls_back_to_first_present_track_when_all_are_bad(tmp_path, monkeypatch):
+    resv = load(tmp_path, RESV_AUDIO_TRACK="1,3,5", RESV_AUDIO_START_ERRORS="2")
+    monkeypatch.setattr(resv, "audio_probe_errors", lambda _snapshot, _track: 2)
+    selector = resv.AudioTrackSelector()
+
+    assert selector.choose_start(b"sample", count=3) == 1

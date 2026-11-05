@@ -14,7 +14,7 @@ By participating, you agree to follow this project's [Code of Conduct](CODE_OF_C
 
 1. **stdlib-only at runtime.** `reservoarr.py` imports only from the Python ≥3.11 standard library. Dispatcharr's container has no pip available to end-users; a runtime `import requests` will break installs. Dev/test deps (pytest, ruff) live in `pyproject.toml`'s `[dev]` extra.
 
-2. **Single deployable file.** The script must keep running unchanged as `reservoarr.py {streamUrl} {userAgent}`. Splitting into a package would force users to vendor multiple files into `/data/scripts/` and breaks the plugin path.
+2. **Single deployable file.** The script must keep running unchanged as `reservoarr.py {streamUrl} {userAgent} {channelId}` (`channelId` optional). Splitting into a package would force users to vendor multiple files into `/data/scripts/` and breaks the plugin path.
 
 3. **Respect the hard invariants.** See [docs/INVARIANTS.md](docs/INVARIANTS.md). Every entry is a load-bearing rule with a documented incident behind it. If you think one is wrong, open an issue describing the new evidence — don't patch around it.
 

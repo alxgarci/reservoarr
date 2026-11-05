@@ -22,7 +22,9 @@ exclusion bias in the rate window). Pacing at the PCR-derived content rate
 banks the front-load surplus by construction - on every connect, including
 the reconnect after a corrupt-loop flush.
 
-Invoked by Dispatcharr as: reservoarr.py {streamUrl} {userAgent}
+Invoked by Dispatcharr as: reservoarr.py {streamUrl} {userAgent} {channelId}
+The channel id is optional; when present it tags every log line and keeps the
+channel's output timestamp timeline continuous across process replacements.
 stdout -> Dispatcharr relay pipe (must carry ONLY the TS stream)
 stderr -> Dispatcharr's transcode logger (INFO only for lines containing
           stream/input/output/video/audio; everything else lands at DEBUG)
@@ -59,10 +61,11 @@ from collections import deque
 from typing import NamedTuple
 
 if len(sys.argv) < 2 or not sys.argv[1].strip():
-    sys.stderr.write("[delaybuf] usage: reservoarr.py <streamUrl> [userAgent]\n")
+    sys.stderr.write("[delaybuf] usage: reservoarr.py <streamUrl> [userAgent] [channelId]\n")
     sys.exit(2)
 URL = sys.argv[1]
 UA = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2].strip() else "Mozilla/5.0"
+CHANNEL_ARG = sys.argv[3].strip() if len(sys.argv) > 3 else ""
 
 CHUNK = 188 * 512                                                     # TS-aligned ~94KB reads
 PACE_SLICE = 188 * 64                                                 # ~12KB write slices for smooth pacing
@@ -125,22 +128,12 @@ AUDIO_START_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_START_ERRORS", "").strip()
 AUDIO_START_ERRORS_OK = (not AUDIO_START_ERRORS_REQUESTED
                          or re.fullmatch(r"[0-9]{1,9}", AUDIO_START_ERRORS_REQUESTED, re.ASCII) is not None)
 AUDIO_START_ERRORS = int(AUDIO_START_ERRORS_REQUESTED) if AUDIO_START_ERRORS_OK and AUDIO_START_ERRORS_REQUESTED else 0
-AUDIO_LIVE_ERRORS_REQUESTED = os.getenv("RESV_AUDIO_LIVE_ERRORS", "").strip()
-AUDIO_LIVE_ERRORS_OK = (not AUDIO_LIVE_ERRORS_REQUESTED
-                        or re.fullmatch(r"[0-9]{1,9}", AUDIO_LIVE_ERRORS_REQUESTED, re.ASCII) is not None)
-AUDIO_LIVE_ERRORS = int(AUDIO_LIVE_ERRORS_REQUESTED) if AUDIO_LIVE_ERRORS_OK and AUDIO_LIVE_ERRORS_REQUESTED else 0
-AUDIO_OFFSET_MS_REQUESTED = os.getenv("RESV_AUDIO_OFFSET_MS", "").strip()
-AUDIO_OFFSET_MS_OK = (not AUDIO_OFFSET_MS_REQUESTED
-                      or re.fullmatch(r"-?[0-9]{1,6}", AUDIO_OFFSET_MS_REQUESTED, re.ASCII) is not None)
-AUDIO_OFFSET_MS = int(AUDIO_OFFSET_MS_REQUESTED) if AUDIO_OFFSET_MS_OK and AUDIO_OFFSET_MS_REQUESTED else 0
 AUDIO_PROBE_BYTES = 3 * 1024 * 1024
 AUDIO_PROBE_TIMEOUT_S = 5.0
 AUDIO_DISCONTINUITY_RE = re.compile(rb"\[aist#0:\d+/[^\]]+\].*timestamp discontinuity")
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
 REWIND_SKIP = os.getenv("RESV_REWIND_SKIP", "0") == "1"
-REWIND_MAX_S = float(os.getenv("RESV_REWIND_MAX_S", "60"))
-REWIND_RECONNECT = os.getenv("RESV_REWIND_RECONNECT", "0") == "1"
 REPLAY_HOLD_BYTES = 1024 * 1024
 REPLAY_MIN_CUSHION_S = 3.0
 REPLAY_STEP_MAX_S = 10.0
@@ -166,8 +159,6 @@ AUDIO_LANG_OK = re.fullmatch(r"[a-z]{3}", AUDIO_LANG) is not None
 AUDIO_FILTERS = []
 if AUDIO_FILL_GAPS:
     AUDIO_FILTERS.append("aresample=async=1")
-if AUDIO_OFFSET_MS:
-    AUDIO_FILTERS.append(f"asetpts=PTS{AUDIO_OFFSET_MS / 1000:+.3f}/TB")
 # No `-fflags +nobuffer`: it costs the whole first GOP of video. The demuxer
 # hands packets on before it has the video's parameter sets, so ffmpeg emits
 # audio from the first sample and video only from the next IDR. On a channel
@@ -188,7 +179,8 @@ FFMPEG_CMD = [
     *(["-metadata:s:a:0", f"language={AUDIO_LANG}"] if AUDIO_LANG_OK else []),
     "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "pipe:1",
 ]
-TS_CHANNEL = re.sub(r"[^A-Za-z0-9_-]", "", os.getenv("RESV_TS_CHANNEL", ""))[:64]
+TS_CHANNEL_REQUESTED = CHANNEL_ARG or os.getenv("RESV_TS_CHANNEL", "")
+TS_CHANNEL = re.sub(r"[^A-Za-z0-9_-]", "", TS_CHANNEL_REQUESTED)[:64]
 TS_WALLCLOCK = os.getenv("RESV_TS_WALLCLOCK", "1") != "0"             # without a channel: start the output on the wall clock
 TS_SEAM_S = 1.0
 TS_SAVE_EVERY_S = 2.0
@@ -206,6 +198,7 @@ RELAY_DRAIN_S = 2.0
 # Last path segment, for log tagging. Strip any query string and cap length so
 # a future provider URL shape can't leak an embedded key into the logs.
 STREAM_ID = URL.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1][:48] or "stream"
+LOG_TAG = f"{STREAM_ID} channel={TS_CHANNEL}" if TS_CHANNEL else STREAM_ID
 LOG_DIR = os.getenv("RESV_LOG_DIR", "/data/scripts/logs")              # Dispatcharr AIO container default
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -239,14 +232,15 @@ def log(msg, stderr=True, file=True):
         _log_writes += 1
         if _log_writes % 512 == 0:                                    # ~2h at stats cadence; ~5min under
             _maybe_rotate()                                           # an ffmpeg-stderr storm
-        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} [{STREAM_ID}] {msg}"
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} [{LOG_TAG}] {msg}"
         try:
             with open(LOG_FILE, "a") as f:
                 f.write(line + "\n")
         except OSError:
             pass
     if stderr:
-        sys.stderr.write(f"[delaybuf] {msg}\n")
+        tag = f" channel={TS_CHANNEL}" if TS_CHANNEL else ""
+        sys.stderr.write(f"[delaybuf{tag}] {msg}\n")
         sys.stderr.flush()
 
 
@@ -1002,20 +996,19 @@ class ReplaySkip:
 class RewindSkip:
     """RESV_REWIND_SKIP: detect a PCR rewind inside one HTTP connection and
     hold the suspect packets until their clock passes the last PCR already
-    admitted. A confirmed overlap is dropped; every ambiguous or unsafe case
-    is fail-open, so it may repeat but cannot create an input outage."""
+    admitted. Only the repeated prefix is dropped; bytes at and after the old
+    seam are returned to ingest. The scanner resynchronizes after corrupt TS
+    bytes and accepts nested passes over the same repeated block."""
 
-    def __init__(self, parser, reservoir, reconnect=None):
+    def __init__(self, parser, reservoir):
         self.parser = parser
         self.reservoir = reservoir
-        self.reconnect = reconnect
         self.on_reconnect()
 
     def on_reconnect(self):
         self.pcr_pid = self.last_pcr = None
         self.reject_run = 0
         self.bypass = False
-        self.ignore_parser_anchor = None
         self._clear_hold()
 
     def _clear_hold(self):
@@ -1024,6 +1017,7 @@ class RewindSkip:
         self.scan = self.first = self.prev = None
         self.advanced_at = 0
         self.marked_discontinuity = False
+        self.nested_rewinds = 0
 
     def discard_held(self):
         """A flushing reconnect discards this gate's bytes with the reservoir."""
@@ -1042,35 +1036,6 @@ class RewindSkip:
             return b""
         return self._release("connection ended before the seam")
 
-    def running_low(self):
-        crate = self.parser.content_rate()
-        return crate is not None and self.reservoir.bytes < crate * REPLAY_MIN_CUSHION_S
-
-    def available_cushion(self):
-        """Conservative seconds currently available while ingest is held. The
-        parser's PCR cushion and the reservoir totals are owned by different
-        threads; bytes/current content-rate is sufficient for this admission
-        decision and cannot overstate safety after a bitrate increase."""
-        crate = self.parser.content_rate()
-        return None if crate is None else self.reservoir.bytes / crate
-
-    def sync_parser_anchor(self):
-        """Use the exact PCR anchor that will parse these bytes next. Keeping a
-        second independent clock let the gate and TsParser diverge on a source
-        with several legal discontinuities: the parser then reported pcr_back
-        even though the upstream gate saw none. A deliberately accepted jump
-        beyond REWIND_MAX_S temporarily owns its new anchor until TsParser has
-        moved off the old one."""
-        p = self.parser
-        if p.pcr_pid is None or p.last_pcr is None:
-            return
-        if self.ignore_parser_anchor is not None:
-            if p.last_pcr == self.ignore_parser_anchor:
-                return
-            self.ignore_parser_anchor = None
-        self.pcr_pid = p.pcr_pid
-        self.last_pcr = p.last_pcr
-
     def _hold(self, data, i, pid, seam, first, marked_discontinuity=False):
         """Keep the packet carrying the first backward PCR and everything
         after it. Bytes before that packet are known-good and can enter the
@@ -1082,27 +1047,22 @@ class RewindSkip:
         self.advanced_at = 0
         self.marked_discontinuity = marked_discontinuity
         behind = (seam - first) % TS_WRAP_S
-        cushion = self.available_cushion()
-        if cushion is not None and cushion < behind + REPLAY_MIN_CUSHION_S:
-            if REWIND_RECONNECT and self.reconnect and self.reconnect(behind, cushion):
-                self._clear_hold()                                    # suspect tail is replaced by the fresh connection
-                self.bypass = True
-                return data[:i]
-            return data[:i] + self._release(
-                f"only {cushion:.1f}s cushion for a {behind:.1f}s rewind")
+        self.nested_rewinds = 1
+        log(f"rewind in connection: holding {behind:.1f}s overlap candidate"
+            f"{' (source discontinuity flag)' if marked_discontinuity else ''}", stderr=False)
         if self.reservoir.bytes + len(self.held) > MAX_BYTES:
             return data[:i] + self._release("rewind does not fit in the reservoir")
-        if self.running_low():
-            return data[:i] + self._release("reservoir running low")
-        return data[:i]
+        # A fast edge can put the whole replay and its first new packet in one
+        # read. Inspect the bytes already held now; waiting for another read
+        # would leave a confirmed seam stuck until unrelated data arrived (or
+        # until EOF, where it would be released fail-open).
+        return data[:i] + self._feed_held(b"")
 
     def _feed_held(self, data):
         held = self.held
         held.extend(data)
         if self.reservoir.bytes + len(held) > MAX_BYTES:
             return self._release("rewind does not fit in the reservoir")
-        if self.running_low():
-            return self._release("reservoir running low")
         pid_seam, seam = self.seam
         i = self.scan
         while i + 188 <= len(held):
@@ -1110,31 +1070,36 @@ class RewindSkip:
                 return self._release("no PCR within the hold limit"
                                      if self.first is None else "PCR not advancing through the rewind")
             if held[i] != 0x47:
-                return self._release("lost TS sync")
+                synced = ts_sync(held, i + 1)
+                if synced < 0:
+                    self.scan = i
+                    return b""
+                i = synced
             found = packet_pcr(held, i)
             if found and found[0] == pid_seam:
                 _, pcr, disc = found
-                if disc:
-                    return self._release("discontinuity flag")
-                step = (pcr - self.prev) % TS_WRAP_S
-                if step > REPLAY_STEP_MAX_S:
-                    return self._release("PCR not advancing through the rewind")
-                if step > 0:
-                    self.prev = pcr
-                    self.advanced_at = i
                 ahead = (pcr - seam) % TS_WRAP_S
                 if 0 < ahead < TS_WRAP_S / 2:
                     skipped = (seam - self.first) % TS_WRAP_S
                     dropped = i
                     marked = self.marked_discontinuity
+                    passes = self.nested_rewinds
                     out = bytes(held[i:])                             # retain the first packet past the seam
                     self._clear_hold()
                     self.last_pcr = seam
                     self.reject_run = 0
                     log(f"rewind in connection: skipped {skipped:.1f}s "
-                        f"({dropped / 1e6:.1f}MB) already delivered"
+                        f"({dropped / 1e6:.1f}MB repeated across {passes} pass"
+                        f"{'es' if passes != 1 else ''})"
                         f"{' (source discontinuity flag)' if marked else ''}", stderr=False)
                     return self.feed(out)                             # observe the retained tail and catch a second rewind
+                behind = (seam - pcr) % TS_WRAP_S
+                if behind < TS_WRAP_S / 2:
+                    raw = pcr - self.prev
+                    if -TS_WRAP_S / 2 < raw < -0.5:
+                        self.nested_rewinds += 1
+                    self.prev = pcr
+                    self.advanced_at = i
             i += 188
         self.scan = i
         return b""
@@ -1144,12 +1109,15 @@ class RewindSkip:
             return data
         if self.seam is not None:
             return self._feed_held(data)
-        self.sync_parser_anchor()
-        i = 0
+        i = ts_sync(data, 0)
+        if i < 0:
+            return data
         while i + 188 <= len(data):
             if data[i] != 0x47:
-                i += 188                                             # do not let an earlier bad packet disable a later real rewind
-                continue                                             # shifted input simply yields no PCR and stays fail-open
+                synced = ts_sync(data, i + 1)
+                if synced < 0:
+                    break
+                i = synced
             found = packet_pcr(data, i)
             if found:
                 pid, pcr, disc = found
@@ -1162,21 +1130,10 @@ class RewindSkip:
                     elif pcr != self.last_pcr:
                         raw = pcr - self.last_pcr
                         if -TS_WRAP_S / 2 < raw < -0.5:
-                            behind = (self.last_pcr - pcr) % TS_WRAP_S
-                            if behind <= REWIND_MAX_S:
-                                # Some sources explicitly mark their overlap-replay as a
-                                # legal discontinuity. The opt-in gate still verifies that
-                                # the clock reaches the old seam before dropping anything.
-                                return self._hold(data, i, pid, self.last_pcr, pcr, disc)
-                            # This is probably a real clock reset. Admit and re-anchor it,
-                            # but keep watching: the same connection may later carry a
-                            # smaller overlap that is inside the configured limit.
-                            log(f"rewind in connection: {behind:.1f}s backward jump"
-                                f"{' with source discontinuity flag' if disc else ''} is beyond "
-                                "RESV_REWIND_MAX_S; re-anchored and passing through", stderr=False)
-                            self.ignore_parser_anchor = self.last_pcr
-                            self.last_pcr = pcr
-                            self.reject_run = 0
+                            # Some sources explicitly mark overlap replay as a legal
+                            # discontinuity. It is still held and only dropped after
+                            # the clock proves the old seam was reached again.
+                            return self._hold(data, i, pid, self.last_pcr, pcr, disc)
                         elif disc:
                             self.last_pcr = pcr
                             self.reject_run = 0
@@ -1328,7 +1285,7 @@ class Upstream:
         self.parser = parser
         self.stop = stop
         self.replay = ReplaySkip(parser, reservoir)
-        self.rewind = RewindSkip(parser, reservoir, self.reconnect_for_rewind)
+        self.rewind = RewindSkip(parser, reservoir)
         self.lock = threading.Lock()                                  # guards the request fields below
         self.force = threading.Event()                                # a reconnect has been requested
         self.flush_pending = False                                    # sticky flush request: set by a flush caller, cleared by the fetcher after it flushes
@@ -1337,7 +1294,6 @@ class Upstream:
         # reconnect then.
         self.last_forced_flush = float("-inf")                        # corrupt-loop / #5 debounce (flush=True)
         self.last_forced_stall = float("-inf")                        # stall watchdog #4 debounce (flush=False)
-        self.last_forced_rewind = float("-inf")                       # optional low-cushion rewind reconnect
         self.response = None                                          # live urllib response (for a forced abort)
         self.corrupt_seen = deque()                                   # (monotonic ts, dts) from ffmpeg stderr
         self.arrived_total = 0                                        # bytes off the wire, held replay and dropped partials included
@@ -1346,20 +1302,11 @@ class Upstream:
         self.reconnects = 0
         self.backoff = 1
 
-    def reconnect_for_rewind(self, behind, cushion):
-        return self.request_reconnect(
-            f"rewind in connection: only {cushion:.1f}s cushion for {behind:.1f}s replay - "
-            "reconnecting upstream, buffer kept",
-            flush=False, rewind=True)
-
-    def request_reconnect(self, reason, flush=True, rewind=False):
+    def request_reconnect(self, reason, flush=True):
         """Forced reconnect shared by the corrupt-loop / #5 detectors (flush=True —
-        buffer is poisoned), the stall watchdog and the optional rewind fallback
-        (flush=False — buffer is good). Debounced PER CLASS (<=1 per 90s each) so
-        a rewind attempt cannot rate-limit away the stall watchdog, and neither
-        can rate-limit away a corrupt flush; the flush request is sticky and is
-        never downgraded by a concurrent no-flush. Returns True if it fired,
-        False if rate-limited."""
+        buffer is poisoned) and the stall watchdog (flush=False — buffer is
+        good). Debounced per class (<=1 per 90s each); the flush request is
+        sticky and is never downgraded by a concurrent no-flush request."""
         now = time.monotonic()
         with self.lock:
             if flush:
@@ -1368,14 +1315,10 @@ class Upstream:
                 self.last_forced_flush = now
                 self.flush_pending = True                             # sticky; the fetcher clears it after flushing
             else:
-                anchor = self.last_forced_rewind if rewind else self.last_forced_stall
-                if now - anchor <= 90:
+                if now - self.last_forced_stall <= 90:
                     return False
-                if rewind:
-                    self.last_forced_rewind = now
-                else:
-                    self.last_forced_stall = now
-                # Leave flush_pending alone: neither no-flush caller may
+                self.last_forced_stall = now
+                # Leave flush_pending alone: a no-flush caller may not
                 # downgrade a concurrent corrupt-loop flush.
             self.force.set()
             # Taken under the lock with the request: once force is set, the next
@@ -1573,10 +1516,9 @@ class Upstream:
             self.ingest(d)
 
 
-def stderr_watcher(ff, on_corrupt, on_audio_discontinuity=None):
-    """Relay ffmpeg stderr (Dispatcharr's logger reads ours), hand every
-    `Packet corrupt` dts to the corrupt-loop detector, and optionally count
-    only audio-input timestamp discontinuities for live track selection."""
+def stderr_watcher(ff, on_corrupt):
+    """Relay ffmpeg stderr (Dispatcharr's logger reads ours) and hand every
+    `Packet corrupt` dts to the corrupt-loop detector."""
     pat = re.compile(rb"Packet corrupt \(stream = \d+, dts = (\d+)\)")
 
     def relay(raw):
@@ -1589,9 +1531,6 @@ def stderr_watcher(ff, on_corrupt, on_audio_discontinuity=None):
         m = pat.search(raw)
         if m:
             on_corrupt(int(m.group(1)))
-        if on_audio_discontinuity and AUDIO_DISCONTINUITY_RE.search(raw):
-            on_audio_discontinuity()
-
     pending = b""
     while True:
         # os.read on the fd returns whatever is already in the pipe, raw or
@@ -1812,21 +1751,16 @@ def audio_probe_errors(snapshot, track):
 class AudioTrackSelector:
     """Opt-in source-track failover. One RESV_AUDIO_TRACK is authoritative;
     several are the only permitted tracks, in priority order. Startup probes a
-    copy of the prefill, so it consumes no live bytes. Live failover asks the
-    pump to retire ffmpeg and start a new one on the next permitted PMT track."""
+    copy of the prefill, so it consumes no live bytes. Priority entries absent
+    from the PMT are skipped without invalidating the rest of the list."""
 
     def __init__(self):
         self.current = AUDIO_TRACK
         self.forced = AUDIO_TRACK_FORCED
         self.priority = AUDIO_TRACKS if AUDIO_TRACK_PRIORITY else ()
         self.start_errors = 0 if self.forced else AUDIO_START_ERRORS
-        self.live_errors = 0 if self.forced else AUDIO_LIVE_ERRORS
-        self.live_enabled = self.live_errors > 0
-        self.errors = 0
         self.bad = set()
         self.count = 1
-        self.switch = threading.Event()
-        self.lock = threading.Lock()
 
     def candidates(self, count):
         if self.priority:
@@ -1838,6 +1772,12 @@ class AudioTrackSelector:
         candidates = self.candidates(self.count)
         fallback = candidates[0] if candidates else AUDIO_TRACK
         self.current = fallback
+        if self.priority and self.start_errors:
+            absent = [track for track in self.priority if track > self.count]
+            if absent:
+                log("startup audio probe: priority track"
+                    f"{'s' if len(absent) != 1 else ''} {','.join(map(str, absent))} "
+                    f"{'are' if len(absent) != 1 else 'is'} absent; ignoring")
         if not self.start_errors or len(candidates) < 2:
             if self.start_errors and len(candidates) < 2:
                 log("startup audio probe: fewer than two permitted audio tracks are present; "
@@ -1862,50 +1802,6 @@ class AudioTrackSelector:
         log(f"startup audio probe: all {len(candidates)} permitted tracks reached "
             f"{self.start_errors} discontinuities; falling back to track {fallback}")
         return self.current
-
-    def on_discontinuity(self):
-        with self.lock:
-            if not self.live_enabled or self.switch.is_set():
-                return
-            self.errors += 1
-            if self.errors >= self.live_errors:
-                self.switch.set()
-
-    def take_switch(self, count):
-        """Return the next track after the live threshold, None to keep the
-        current ffmpeg. Every track is tried at most once; when all are bad the
-        selector returns to the first permitted track and disables itself to
-        avoid a restart loop."""
-        with self.lock:
-            if not self.switch.is_set():
-                return None
-            self.count = max(count, 1)
-            failed = self.current
-            self.bad.add(failed)
-            candidates = self.candidates(self.count)
-            fallback = candidates[0] if candidates else AUDIO_TRACK
-            if failed in candidates:
-                at = candidates.index(failed)
-                order = candidates[at + 1:] + candidates[:at]
-            else:
-                order = candidates
-            candidates = [track for track in order if track not in self.bad]
-            self.switch.clear()
-            self.errors = 0
-            if candidates:
-                self.current = candidates[0]
-                log(f"audio track {failed} reached {self.live_errors} timestamp discontinuities; "
-                    f"switching live to track {self.current} (ffmpeg map 0:a:{self.current - 1})")
-                return self.current
-            self.live_enabled = False
-            if self.current != fallback:
-                self.current = fallback
-                log(f"all permitted audio tracks reached the live threshold; returning to track {fallback} "
-                    "and disabling automatic live switching")
-                return self.current
-            log(f"all permitted audio tracks reached the live threshold; staying on track {fallback} "
-                "and disabling automatic live switching")
-            return None
 
 
 class Stream:
@@ -1937,15 +1833,14 @@ class Stream:
         silent = time.monotonic() - self.upstream.last_arrival
         return silent if silent >= max(DRY_EXIT_S, 2 * self.parser.chunk_s()) else None
 
-    def watch_ffmpeg(self, ff, retiring=None, selector=None):
+    def watch_ffmpeg(self, ff, retiring=None):
         """Relay ffmpeg's stderr until it closes, i.e. until ffmpeg is gone. If
         nothing asked it to go (OOM kill, crash), end the stream: with the
         reservoir empty nothing writes to its stdin, so the dead pipe went
         unnoticed and the channel sat on dead air instead of ending, which is
         what lets Dispatcharr retry or fail over."""
         retiring = retiring or threading.Event()
-        stderr_watcher(ff, self.upstream.register_corrupt,
-                       selector.on_discontinuity if selector else None)
+        stderr_watcher(ff, self.upstream.register_corrupt)
         if self.stop.is_set() or retiring.is_set():
             return
         try:
@@ -1957,38 +1852,29 @@ class Stream:
         log(f"ffmpeg exited on its own (rc={rc}); shutting down")
         self.shutdown()
 
-    def start_ffmpeg(self, track, timeline, selector):
+    def start_ffmpeg(self, track, timeline):
         offset = output_ts_offset(timeline, time.time())
         ff = subprocess.Popen(ffmpeg_cmd(offset, track), stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE if timeline else None, stderr=subprocess.PIPE, bufsize=0)
         self.active_ff = ff
         retiring = threading.Event()
-        threading.Thread(target=self.watch_ffmpeg, args=(ff, retiring, selector), daemon=True).start()
+        threading.Thread(target=self.watch_ffmpeg, args=(ff, retiring), daemon=True).start()
         relay = None
         if timeline:
-            if TS_CHANNEL:
-                log(f"ts timeline: channel {TS_CHANNEL} starts at {timeline.origin:.3f}s "
-                    f"(output offset {timeline.offset:.3f}s)")
-            else:
-                log(f"live audio-switch timeline starts at {timeline.origin:.3f}s "
-                    f"(output offset {timeline.offset:.3f}s)")
+            log(f"ts timeline: channel {TS_CHANNEL} starts at {timeline.origin:.3f}s "
+                f"(output offset {timeline.offset:.3f}s)")
             relay = threading.Thread(target=stdout_relay, args=(ff, timeline), daemon=True)
             relay.start()
         elif offset is not None:
             log(f"output timestamps start on the wall clock (offset {offset:.3f}s)")
         return ff, retiring, relay
 
-    def retire_ffmpeg(self, ff, retiring, relay, drain=False):
+    def retire_ffmpeg(self, ff, retiring, relay):
         retiring.set()
         try:
             ff.stdin.close()
         except Exception:
             pass
-        if drain:
-            try:
-                ff.wait(timeout=RELAY_DRAIN_S)
-            except subprocess.TimeoutExpired:
-                pass
         if ff.poll() is None:
             try:
                 ff.terminate()
@@ -2020,8 +1906,7 @@ class Stream:
         if selector.start_errors or selector.priority:
             snapshot = self.reservoir.snapshot(AUDIO_PROBE_BYTES) if selector.start_errors else b""
             selector.choose_start(snapshot, len(self.parser.audio_pids))
-        timeline = (Timeline(timeline_path(), time.time()) if TS_CHANNEL else
-                    Timeline(None, time.time()) if selector.live_enabled else None)
+        timeline = Timeline(timeline_path(), time.time()) if TS_CHANNEL else None
         if STALL_S > 0:
             threading.Thread(target=self.upstream.stall_watchdog, daemon=True).start()
 
@@ -2046,21 +1931,15 @@ class Stream:
         retiring = None
         relay = None
         try:
-            while not self.stop.is_set():
-                ff, retiring, relay = self.start_ffmpeg(selector.current, timeline, selector)
-                reason, next_track = self.pump(ff, timeline, pacer, selector)
-                self.retire_ffmpeg(ff, retiring, relay, drain=reason == "audio-switch")
-                last_rc = ff.returncode
-                if timeline:
-                    timeline.save(time.time())
-                    if timeline.rejected:
-                        log(f"ts timeline: ignored {timeline.rejected} output PTS more than "
-                            f"{TS_MAX_LEAD_S:.0f}s ahead of the wall clock")
-                if reason != "audio-switch" or self.stop.is_set():
-                    break
-                if timeline:
-                    timeline = Timeline(timeline_path() if TS_CHANNEL else None, time.time(), after=timeline.end())
-                log(f"restarting ffmpeg on source audio track {next_track}")
+            ff, retiring, relay = self.start_ffmpeg(selector.current, timeline)
+            self.pump(ff, timeline, pacer)
+            self.retire_ffmpeg(ff, retiring, relay)
+            last_rc = ff.returncode
+            if timeline:
+                timeline.save(time.time())
+                if timeline.rejected:
+                    log(f"ts timeline: ignored {timeline.rejected} output PTS more than "
+                        f"{TS_MAX_LEAD_S:.0f}s ahead of the wall clock")
         except (BrokenPipeError, OSError) as e:
             log(f"stream consumer gone ({type(e).__name__}); shutting down")
         except ValueError:
@@ -2080,27 +1959,22 @@ class Stream:
                 last_rc = ff.returncode
             log(f"stream wrapper exit (ffmpeg rc={last_rc})")
 
-    def pump(self, ff, timeline, pacer=None, selector=None):
+    def pump(self, ff, timeline, pacer=None):
         """Release the reservoir to ffmpeg's stdin at the content rate, and log
         the telemetry line every STATS_EVERY_S - also while the reservoir is
         dry, when the cushion it reports is the one thing worth knowing. Returns
         once the fetcher has ended, or once the upstream has been down too long
         with nothing left to release (dry_exit_due)."""
         pacer = pacer or Pacer(self.parser, self.reservoir)
-        selector = selector or AudioTrackSelector()
         delivered = False
         told_staying = False
         out_since_stats = 0
         last_stats = time.monotonic()
         tail = b""                                                    # see align_to_188(): ffmpeg expects 188-aligned writes
         while not self.stop.is_set():
-            if selector.switch.is_set():
-                next_track = selector.take_switch(len(self.parser.audio_pids))
-                if next_track is not None:
-                    return "audio-switch", next_track
             d, released_total = self.reservoir.take(timeout=0.5)
             if d is None:
-                return "end", None
+                return
             level = pacer.measure(released_total)
             if d:
                 pacer.pace(len(d), level)
@@ -2130,7 +2004,7 @@ class Stream:
                 self.report(level, out_since_stats / (now - last_stats))
                 out_since_stats = 0
                 last_stats = now
-        return "end", None
+        return
 
     def report(self, level, orate):
         p, res = self.parser, self.reservoir
@@ -2163,21 +2037,10 @@ def main():
             f"releasing the stream at no less than realtime (1.0)")
     if not AUDIO_START_ERRORS_OK:
         log(f"RESV_AUDIO_START_ERRORS={AUDIO_START_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
-    if not AUDIO_LIVE_ERRORS_OK:
-        log(f"RESV_AUDIO_LIVE_ERRORS={AUDIO_LIVE_ERRORS_REQUESTED!r} is not a non-negative integer; disabled")
-    if not AUDIO_OFFSET_MS_OK:
-        log(f"RESV_AUDIO_OFFSET_MS={AUDIO_OFFSET_MS_REQUESTED!r} is not a signed integer; disabled")
-    elif AUDIO_OFFSET_MS:
-        action = "advancing" if AUDIO_OFFSET_MS < 0 else "delaying"
-        log(f"{action} output audio by {abs(AUDIO_OFFSET_MS)}ms (RESV_AUDIO_OFFSET_MS={AUDIO_OFFSET_MS})")
-    if AUDIO_TRACK_FORCED and (AUDIO_START_ERRORS or AUDIO_LIVE_ERRORS):
-        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK} is forced; automatic startup and live audio selection ignored")
+    if AUDIO_TRACK_FORCED and AUDIO_START_ERRORS:
+        log(f"RESV_AUDIO_TRACK={AUDIO_TRACK} is forced; automatic startup audio selection ignored")
     if REWIND_SKIP:
-        log(f"in-connection rewind skip enabled (RESV_REWIND_MAX_S={REWIND_MAX_S:g})")
-    if REWIND_RECONNECT and REWIND_SKIP:
-        log("low-cushion rewind reconnect enabled (RESV_REWIND_RECONNECT=1)")
-    elif REWIND_RECONNECT:
-        log("RESV_REWIND_RECONNECT=1 ignored because RESV_REWIND_SKIP=0")
+        log("in-connection rewind skip enabled")
     announce_audio_codec()
     announce_audio_track()
     Stream(URL, UA).run()
