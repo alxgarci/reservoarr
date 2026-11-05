@@ -194,7 +194,7 @@ RELAY_DRAIN_S = 2.0
 def stream_id(url):
     """Short, credential-free identifier used in every journal tag.
 
-    Ordinary URLs keep their final path segment. AceStream's HTTP gateway uses
+    Ordinary URLs keep their final path segment. P2P network HTTP gateway uses
     the generic `/ace/getstream` path and puts the actual content hash in the
     `id` query parameter, so use that value when it is a valid 40-character hex
     hash. Other query values stay out of the logs.

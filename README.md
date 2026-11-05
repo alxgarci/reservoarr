@@ -108,8 +108,6 @@ You should see one stats line per active stream every 15 seconds. The shape is:
 2026-06-21T10:03:33+0000 [500004175] cushion=27s(pcr) buf=15.5MB out=4.66Mbps in=4.96Mbps crate=4.80Mbps in_total=1843MB reconnects=0 ccerr=0 pcrrej=0 disc=0 sync=0 pcr_back=0 vholes=0% aholes=0% dry=0.0s maxgap=0.2s
 ```
 
-The value in brackets is the stream identifier. For `/ace/getstream?id=<40-character-hash>` URLs it is the AceStream hash rather than the generic `getstream` path; other URLs keep their final path segment.
-
 **Healthy after ~60s:**
 - `cushion=` reaches `~25–30s(pcr)` and oscillates within ±6s of that, on a CDN that front-loads that much plus the 5s headstart (see [Cushion never reaches the target](#cushion-never-reaches-the-target)). The `(pcr)` suffix means the cushion is measured off the PCR clock (good); `(byte)` is a degraded fallback.
 - `ccerr`, `pcrrej`, `disc`, `sync`, `pcr_back` flat at zero.
