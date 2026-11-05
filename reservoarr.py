@@ -22,9 +22,7 @@ exclusion bias in the rate window). Pacing at the PCR-derived content rate
 banks the front-load surplus by construction - on every connect, including
 the reconnect after a corrupt-loop flush.
 
-Invoked by Dispatcharr as: reservoarr.py {streamUrl} {userAgent} {channelId}
-The channel id is optional; when present it tags every log line and keeps the
-channel's output timestamp timeline continuous across process replacements.
+Invoked by Dispatcharr as: reservoarr.py {streamUrl} {userAgent}
 stdout -> Dispatcharr relay pipe (must carry ONLY the TS stream)
 stderr -> Dispatcharr's transcode logger (INFO only for lines containing
           stream/input/output/video/audio; everything else lands at DEBUG)
@@ -61,11 +59,10 @@ from collections import deque
 from typing import NamedTuple
 
 if len(sys.argv) < 2 or not sys.argv[1].strip():
-    sys.stderr.write("[delaybuf] usage: reservoarr.py <streamUrl> [userAgent] [channelId]\n")
+    sys.stderr.write("[delaybuf] usage: reservoarr.py <streamUrl> [userAgent]\n")
     sys.exit(2)
 URL = sys.argv[1]
 UA = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2].strip() else "Mozilla/5.0"
-CHANNEL_ARG = sys.argv[3].strip() if len(sys.argv) > 3 else ""
 
 CHUNK = 188 * 512                                                     # TS-aligned ~94KB reads
 PACE_SLICE = 188 * 64                                                 # ~12KB write slices for smooth pacing
@@ -179,8 +176,7 @@ FFMPEG_CMD = [
     *(["-metadata:s:a:0", f"language={AUDIO_LANG}"] if AUDIO_LANG_OK else []),
     "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "pipe:1",
 ]
-TS_CHANNEL_REQUESTED = CHANNEL_ARG or os.getenv("RESV_TS_CHANNEL", "")
-TS_CHANNEL = re.sub(r"[^A-Za-z0-9_-]", "", TS_CHANNEL_REQUESTED)[:64]
+TS_CHANNEL = re.sub(r"[^A-Za-z0-9_-]", "", os.getenv("RESV_TS_CHANNEL", ""))[:64]
 TS_WALLCLOCK = os.getenv("RESV_TS_WALLCLOCK", "1") != "0"             # without a channel: start the output on the wall clock
 TS_SEAM_S = 1.0
 TS_SAVE_EVERY_S = 2.0
@@ -195,10 +191,24 @@ RELAY_DRAIN_S = 2.0
 # (output_ts_offset(), the RESV_TS_CHANNEL timeline) and the marker of
 # claim_dry_exit(), which has to outlive this process.
 
-# Last path segment, for log tagging. Strip any query string and cap length so
-# a future provider URL shape can't leak an embedded key into the logs.
-STREAM_ID = URL.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1][:48] or "stream"
-LOG_TAG = f"{STREAM_ID} channel={TS_CHANNEL}" if TS_CHANNEL else STREAM_ID
+def stream_id(url):
+    """Short, credential-free identifier used in every journal tag.
+
+    Ordinary URLs keep their final path segment. AceStream's HTTP gateway uses
+    the generic `/ace/getstream` path and puts the actual content hash in the
+    `id` query parameter, so use that value when it is a valid 40-character hex
+    hash. Other query values stay out of the logs.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if any(segment.lower() == "ace" for segment in segments):
+        ace_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0].strip()
+        if re.fullmatch(r"[0-9A-Fa-f]{40}", ace_id, re.ASCII):
+            return ace_id
+    return (segments[-1][:48] if segments else "stream") or "stream"
+
+
+STREAM_ID = stream_id(URL)
 LOG_DIR = os.getenv("RESV_LOG_DIR", "/data/scripts/logs")              # Dispatcharr AIO container default
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -232,15 +242,14 @@ def log(msg, stderr=True, file=True):
         _log_writes += 1
         if _log_writes % 512 == 0:                                    # ~2h at stats cadence; ~5min under
             _maybe_rotate()                                           # an ffmpeg-stderr storm
-        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} [{LOG_TAG}] {msg}"
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} [{STREAM_ID}] {msg}"
         try:
             with open(LOG_FILE, "a") as f:
                 f.write(line + "\n")
         except OSError:
             pass
     if stderr:
-        tag = f" channel={TS_CHANNEL}" if TS_CHANNEL else ""
-        sys.stderr.write(f"[delaybuf{tag}] {msg}\n")
+        sys.stderr.write(f"[delaybuf] {msg}\n")
         sys.stderr.flush()
 
 

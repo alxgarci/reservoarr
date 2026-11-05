@@ -40,7 +40,7 @@ If you didn't set it as default in step 3, assign it per-channel: Channels → E
 
 That's it. Now [tune a channel](#first-channel-tune) to confirm it's working.
 
-> Tuning (cushion size, watchdog thresholds, log directory, audio language, etc.) uses `RESV_*` variables, but **not as container environment variables** — Dispatcharr starts its workers through `su -`, which clears them, so a variable set on the container (Docker, Unraid) is ignored. Put them in a stream profile: command `/usr/bin/env`, parameters `RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent} {channelId}`. Create a separate profile for it; **Generate Stream Profile** resets the one it made. Defaults fit most providers, so override only with evidence. Full steps and the variable list: [docs/TUNABLES.md](docs/TUNABLES.md#where-settings-go).
+> Tuning (cushion size, watchdog thresholds, log directory, audio language, etc.) uses `RESV_*` variables, but **not as container environment variables** — Dispatcharr starts its workers through `su -`, which clears them, so a variable set on the container (Docker, Unraid) is ignored. Put them in a stream profile: command `/usr/bin/env`, parameters `RESV_X=value /data/reservoarr/reservoarr.py {streamUrl} {userAgent}`. Create a separate profile for it; **Generate Stream Profile** resets the one it made. Defaults fit most providers, so override only with evidence. Full steps and the variable list: [docs/TUNABLES.md](docs/TUNABLES.md#where-settings-go).
 
 ### Option 2 — Vendored copy + manual Stream Profile
 
@@ -51,7 +51,7 @@ That's it. Now [tune a channel](#first-channel-tune) to confirm it's working.
    |---|---|
    | **Name** | `delay-buffer` |
    | **Command** | `/data/scripts/reservoarr.py` |
-   | **Parameters** | `{streamUrl} {userAgent} {channelId}` |
+   | **Parameters** | `{streamUrl} {userAgent}` |
    | **Active** | yes |
 
 3. Set it as the instance-wide default (Settings → Stream Settings → Default Stream Profile) or per-channel under Channels → Edit → Stream Profile.
@@ -84,7 +84,7 @@ The Stream Profile DB row can be created idempotently via Dispatcharr's `manage.
 ```python
 from core.models import StreamProfile, CoreSettings
 desired = {"command": "/data/scripts/reservoarr.py",
-           "parameters": "{streamUrl} {userAgent} {channelId}", "is_active": True}
+           "parameters": "{streamUrl} {userAgent}", "is_active": True}
 p, _ = StreamProfile.objects.get_or_create(name="delay-buffer", defaults=desired)
 for k, v in desired.items():
     setattr(p, k, v)
@@ -107,6 +107,8 @@ You should see one stats line per active stream every 15 seconds. The shape is:
 ```
 2026-06-21T10:03:33+0000 [500004175] cushion=27s(pcr) buf=15.5MB out=4.66Mbps in=4.96Mbps crate=4.80Mbps in_total=1843MB reconnects=0 ccerr=0 pcrrej=0 disc=0 sync=0 pcr_back=0 vholes=0% aholes=0% dry=0.0s maxgap=0.2s
 ```
+
+The value in brackets is the stream identifier. For `/ace/getstream?id=<40-character-hash>` URLs it is the AceStream hash rather than the generic `getstream` path; other URLs keep their final path segment.
 
 **Healthy after ~60s:**
 - `cushion=` reaches `~25–30s(pcr)` and oscillates within ±6s of that, on a CDN that front-loads that much plus the 5s headstart (see [Cushion never reaches the target](#cushion-never-reaches-the-target)). The `(pcr)` suffix means the cushion is measured off the PCR clock (good); `(byte)` is a degraded fallback.

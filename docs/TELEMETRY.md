@@ -5,10 +5,10 @@
 ## Stats line
 
 ```
-2026-06-14T10:03:33+0200 [500004175 channel=31] cushion=27s(pcr) buf=15.5MB out=4.66Mbps in=4.96Mbps crate=4.80Mbps in_total=1843MB reconnects=0 ccerr=0 pcrrej=0 disc=0 sync=0 pcr_back=0 vholes=0% aholes=0% dry=0.0s maxgap=0.2s
+2026-06-14T10:03:33+0200 [44828a7580cd99fcb36245c327889c47f34b457f] cushion=27s(pcr) buf=15.5MB out=4.66Mbps in=4.96Mbps crate=4.80Mbps in_total=1843MB reconnects=0 ccerr=0 pcrrej=0 disc=0 sync=0 pcr_back=0 vholes=0% aholes=0% dry=0.0s maxgap=0.2s
 ```
 
-When the optional third `{channelId}` argument (or legacy `RESV_TS_CHANNEL`) is present, every file line uses `[stream-id channel=id]` and every stderr line uses `[delaybuf channel=id]`. With no channel id, the old tags remain unchanged.
+The value in brackets is `STREAM_ID`. Normally it is the URL's final path segment. For an AceStream gateway URL such as `/ace/getstream?id=44828a…`, the path segment `getstream` is generic, so reservoarr instead uses the validated 40-character hexadecimal `id` hash. Query parameters from other URLs are never copied into the log tag.
 
 | Field | Meaning |
 |---|---|
