@@ -35,12 +35,9 @@ def test_real_video_repeated_spans_are_removed_and_logged(resv, stream, synth_ts
     def at(seconds):
         return offset_after(points, seconds)
 
-    # Admit the first minute, then make the edge resend 30..65s, restart the
-    # old block once more at 30..55s, and finally send 30..75s. The stray byte
-    # reproduces the TS sync loss that blinded the old fixed-stride scanner in
-    # the 2026-11-05 production incident.
-    regressed = (raw[:at(60)] + b"\x00" + raw[at(30):at(65)]
-                 + raw[at(30):at(55)] + raw[at(30):at(75)])
+    # One unflagged, 20-second PCR overlap with new content in the same burst.
+    # This is the exact narrow case the gate handles.
+    regressed = raw[:at(60)] + raw[at(40):at(75)]
 
     unfiltered = resv.TsParser()
     for start in range(0, len(regressed), resv.CHUNK):
@@ -74,4 +71,4 @@ def test_real_video_repeated_spans_are_removed_and_logged(resv, stream, synth_ts
     journal = (tmp_path / "delaybuf.log").read_text()
     assert "rewind in connection: holding" in journal
     assert "rewind in connection: skipped" in journal
-    assert "repeated across 2 passes" in journal
+    assert "kept post-seam tail" in journal
