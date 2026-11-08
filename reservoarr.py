@@ -132,6 +132,7 @@ AUDIO_DISCONTINUITY_RE = re.compile(rb"\[aist#0:\d+/[^\]]+\].*timestamp disconti
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
 REWIND_SKIP = os.getenv("RESV_REWIND_SKIP", "0") == "1"
+TS_SEAM_REPAIR = os.getenv("RESV_TS_SEAM_REPAIR", "0") == "1"
 REPLAY_HOLD_BYTES = 1024 * 1024
 REPLAY_MIN_CUSHION_S = 3.0
 REPLAY_STEP_MAX_S = 10.0
@@ -494,6 +495,109 @@ def packet_pcr(buf_, i):
         return None
     pid = (buf_[i + 1] & 0x1F) << 8 | buf_[i + 2]
     return pid, pcr_seconds(buf_, i), bool(buf_[i + 5] & 0x80)
+
+
+class TsSeamRepair:
+    """Keep every TS packet when an unmarked source restart resets its clocks.
+
+    A source restart can reset PCR, PES timestamps and continuity counters at
+    once without setting discontinuity_indicator. Confirm all three signals
+    on the video PCR packet before touching anything. Subsequent timestamps
+    and counters are translated; packet order and payload stay intact.
+    """
+
+    def __init__(self):
+        self.last_pcr = None
+        self.last_dts = {}
+        self.last_cc = {}
+        self.cc_bias = {}
+        self.pending_cc = set()
+        self.offset = 0
+        self.seams = 0
+
+    @staticmethod
+    def _pes(buf_, i):
+        if not (buf_[i + 1] & 0x40) or not (buf_[i + 3] & 0x10):
+            return None
+        start = i + 4
+        if buf_[i + 3] & 0x20:
+            start += 1 + buf_[i + 4]
+        if start + 14 > i + 188 or buf_[start:start + 3] != b"\x00\x00\x01":
+            return None
+        flags = buf_[start + 7] & 0xC0
+        if not flags & 0x80 or start + (19 if flags == 0xC0 else 14) > i + 188:
+            return None
+        pts_at = start + 9
+        dts_at = start + 14 if flags == 0xC0 else pts_at
+        return pts_at, dts_at
+
+    @staticmethod
+    def _write_time(buf_, at, value):
+        value &= (1 << 33) - 1
+        buf_[at] = (buf_[at] & 0xF0) | ((value >> 30) & 7) << 1 | 1
+        buf_[at + 1] = value >> 22 & 0xFF
+        buf_[at + 2] = ((value >> 15) & 0x7F) << 1 | 1
+        buf_[at + 3] = value >> 7 & 0xFF
+        buf_[at + 4] = (value & 0x7F) << 1 | 1
+
+    def feed(self, data):
+        if not TS_SEAM_REPAIR or not data:
+            return data
+        if len(data) % 188 or data[0] != 0x47:
+            return data  # never modify an unaligned or non-TS response
+        out = bytearray(data)
+        for i in range(0, len(out), 188):
+            if out[i] != 0x47:
+                continue
+            pid = (out[i + 1] & 0x1F) << 8 | out[i + 2]
+            afc = out[i + 3] >> 4 & 3
+            pes = self._pes(out, i)
+            pcr = packet_pcr(out, i)
+            if pcr and pcr[0] == pid:
+                raw_pcr = round(pcr[1] * 90000)
+                old = self.last_pcr
+                if (old is not None and not pcr[2] and pes is not None
+                        and 5 * 90000 < old < 3600 * 90000
+                        and raw_pcr <= 90000 and old - raw_pcr > 5 * 90000
+                        and pid in self.last_dts):
+                    raw_dts = pes_time(out, pes[1])
+                    prev_dts = self.last_dts[pid]
+                    # A PCR blip alone is not a source restart. The PES clock
+                    # must reset by the same amount, within one second.
+                    dts_back = (prev_dts - self.offset) - raw_dts
+                    if abs(dts_back - (old - raw_pcr)) <= 90000:
+                        self.offset = prev_dts + 3600 - raw_dts
+                        self.pending_cc = set(self.last_cc)
+                        self.cc_bias.clear()
+                        self.seams += 1
+                        log(f"TS seam repair: clock reset {old / 90000:.3f}s -> "
+                            f"{raw_pcr / 90000:.3f}s, rebasing timestamps by "
+                            f"{self.offset / 90000:.3f}s; preserving all packets", stderr=False)
+                self.last_pcr = raw_pcr
+                if self.offset:
+                    base = (raw_pcr + self.offset) & ((1 << 33) - 1)
+                    out[i + 6] = base >> 25 & 0xFF
+                    out[i + 7] = base >> 17 & 0xFF
+                    out[i + 8] = base >> 9 & 0xFF
+                    out[i + 9] = base >> 1 & 0xFF
+                    out[i + 10] = (out[i + 10] & 0x7F) | (base & 1) << 7
+            if pes:
+                pts_at, dts_at = pes
+                raw_dts = pes_time(out, dts_at)
+                self.last_dts[pid] = raw_dts + self.offset
+                if self.offset:
+                    self._write_time(out, pts_at, pes_time(out, pts_at) + self.offset)
+                    if dts_at != pts_at:
+                        self._write_time(out, dts_at, raw_dts + self.offset)
+            if pid != 0x1FFF and afc & 1:
+                raw_cc = out[i + 3] & 15
+                if pid in self.pending_cc:
+                    self.cc_bias[pid] = (self.last_cc[pid] + 1 - raw_cc) & 15
+                    self.pending_cc.remove(pid)
+                cc = (raw_cc + self.cc_bias.get(pid, 0)) & 15
+                out[i + 3] = (out[i + 3] & 0xF0) | cc
+                self.last_cc[pid] = cc
+        return bytes(out)
 
 class TsParser:
     """Observes the ingest byte stream at TS-packet level. Two jobs:
@@ -1356,6 +1460,7 @@ class Upstream:
         self.stop = stop
         self.replay = ReplaySkip(parser, reservoir)
         self.rewind = RewindSkip(parser, reservoir)
+        self.seam_repair = TsSeamRepair()
         self.lock = threading.Lock()                                  # guards the request fields below
         self.force = threading.Event()                                # a reconnect has been requested
         self.flush_pending = False                                    # sticky flush request: set by a flush caller, cleared by the fetcher after it flushes
@@ -1456,11 +1561,11 @@ class Upstream:
                         f"upstream gap {gap:.1f}s with {self.reservoir.bytes / 1e6:.1f}MB buffered; "
                         "reconnecting early, buffer kept", flush=False):
                     last_adv = time.monotonic()
-            elif STALL_S > 0 and gap > STALL_S and not self.force.is_set():
-                if self.request_reconnect(
-                        f"upstream stalled (no data {gap:.0f}s) - reconnecting, buffer kept",
-                        flush=False):
-                    last_adv = time.monotonic()
+            elif (STALL_S > 0 and gap > STALL_S and not self.force.is_set()
+                  and self.request_reconnect(
+                      f"upstream stalled (no data {gap:.0f}s) - reconnecting, buffer kept",
+                      flush=False)):
+                last_adv = time.monotonic()
 
     def take_max_gap(self):
         """The longest wait between arrivals since the last call, the one still
@@ -1594,6 +1699,7 @@ class Upstream:
             self.pass_rewind(d)
 
     def pass_rewind(self, d):
+        d = self.seam_repair.feed(d)
         d = self.rewind.feed(d)
         if d:
             self.ingest(d)
