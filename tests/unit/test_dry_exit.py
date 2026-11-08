@@ -5,7 +5,6 @@ delivered nothing stays: it is waiting for its first byte."""
 from __future__ import annotations
 
 import io
-import os
 import threading
 import time
 from pathlib import Path
@@ -174,9 +173,8 @@ def stays(stream):
     return alive
 
 
-def test_a_second_outage_on_the_url_within_the_window_rides_it_out(resv, tmp_path, capsys):
-    """Three exits end a channel with no other stream, and a short blip clears
-    nothing in between. Measured on Dispatcharr 0.33: the third 8s blip."""
+def test_a_second_process_on_the_same_url_exits_when_dry(resv, capsys):
+    """Dispatcharr retries a failed URL; its retry needs to fail to reach backup."""
     first = resv.Stream(resv.URL, resv.UA)
     outage(first, 6.0)
     pump_in_thread(first).join(2)
@@ -184,58 +182,10 @@ def test_a_second_outage_on_the_url_within_the_window_rides_it_out(resv, tmp_pat
 
     second = resv.Stream(resv.URL, resv.UA)
     outage(second, 6.0)
-    assert stays(second)
-    err = capsys.readouterr().err
-    assert "exiting" not in err
-    assert err.count("staying, at most one exit per stream URL every 31 min (last exit ") == 1
-
-
-def test_the_exit_is_allowed_again_after_the_window(resv, tmp_path):
-    now = time.time()
-    assert resv.claim_dry_exit(resv.URL, now) is None
-    assert resv.claim_dry_exit(resv.URL, now + resv.DRY_EXIT_EVERY_S - 1) == resv.DRY_EXIT_EVERY_S - 1
-    assert resv.claim_dry_exit(resv.URL, now + resv.DRY_EXIT_EVERY_S) is None
-
-
-def test_the_window_outlasts_dispatcharrs_retry_window(resv):
-    assert resv.DRY_EXIT_EVERY_S > 1800
-
-
-def test_another_url_has_its_own_exit(resv):
-    now = time.time()
-    assert resv.claim_dry_exit("http://a.test/1.ts", now) is None
-    assert resv.claim_dry_exit("http://a.test/2.ts", now) is None
-    assert resv.claim_dry_exit("http://a.test/1.ts", now) is not None
-
-
-def test_a_marker_from_the_future_does_not_block_forever(resv):
-    now = time.time()
-    assert resv.claim_dry_exit(resv.URL, now + 86400) is None
-    assert resv.claim_dry_exit(resv.URL, now) is None
-
-
-def test_a_marker_that_cannot_be_written_means_staying(resv, stream, tmp_path, capsys):
-    resv.LOG_DIR = str(tmp_path / "missing")
-    assert resv.claim_dry_exit(resv.URL, time.time()) == float("inf")
-    outage(stream, 6.0)
-    assert stays(stream)
-    assert "marker not writable" in capsys.readouterr().err
-
-
-def test_the_marker_name_carries_no_part_of_the_url(resv, tmp_path):
-    secret = "http://user:hunter2@edge.test/live/hunter2.ts"
-    assert resv.claim_dry_exit(secret, time.time()) is None
-    names = [n for n in os.listdir(tmp_path) if n.startswith("dryexit-")]
-    assert len(names) == 1
-    assert "hunter2" not in names[0]
-
-
-def test_the_staying_line_stays_out_of_dispatcharrs_error_keywords(resv, stream, capsys):
-    resv.claim_dry_exit(resv.URL, time.time())
-    outage(stream, 6.0)
-    assert stays(stream)
-    line = next(ln for ln in capsys.readouterr().err.splitlines() if "staying" in ln)
-    assert not any(word in line.lower() for word in ("error", "failed", "cannot", "invalid", "corrupt"))
+    t = pump_in_thread(second)
+    t.join(2)
+    assert not t.is_alive()
+    assert "exiting so Dispatcharr" in capsys.readouterr().err
 
 
 def test_the_exit_is_in_the_log_file(resv, stream):

@@ -98,7 +98,11 @@ def test_unresolved_overlap_fails_open_at_reserve(resv, stream, tmp_path):
     feed(stream, span(125.1, 126))
     assert stream.upstream.rewind.bypass
     assert "10s safety reserve" in (tmp_path / "delaybuf.log").read_text()
-    assert "filter bypassed until next connection" in (tmp_path / "delaybuf.log").read_text()
+    assert "filter cooling down; will rearm in this connection" in (tmp_path / "delaybuf.log").read_text()
+    stream.upstream.rewind._cushion_s = lambda: 25.0
+    feed(stream, span(126.1, 129))
+    assert not stream.upstream.rewind.bypass
+    assert "filter rearmed in same connection" in (tmp_path / "delaybuf.log").read_text()
 
 
 def test_enabled_heartbeat_explains_idle_and_bypassed_states(resv, stream, tmp_path):
@@ -116,4 +120,30 @@ def test_enabled_heartbeat_explains_idle_and_bypassed_states(resv, stream, tmp_p
     rewind.bypass = True
     rewind.last_status_at -= 16
     feed(stream, span(102.1, 103))
-    assert "status=bypassed until reconnect" in (tmp_path / "delaybuf.log").read_text()
+    assert "status=cooldown" in (tmp_path / "delaybuf.log").read_text()
+
+
+def test_fail_open_rearms_on_recovered_cushion_and_new_pcr_progress(resv, stream, tmp_path):
+    resv.REWIND_SKIP = True
+    normal = span(100, 140)
+    feed(stream, normal)
+    rewind = stream.upstream.rewind
+    rewind._enter_cooldown()
+    feed(stream, span(140.1, 145))
+    assert not rewind.bypass
+    assert rewind.seam is None
+    assert "filter rearmed in same connection" in (tmp_path / "delaybuf.log").read_text()
+    replay = span(125, 150)
+    feed(stream, replay)
+    assert "skipped 20.0s" in (tmp_path / "delaybuf.log").read_text()
+
+
+def test_low_cushion_passes_overlap_without_starting_doomed_hold(resv, stream, tmp_path):
+    resv.REWIND_SKIP = True
+    feed(stream, span(100, 140))
+    stream.upstream.rewind._cushion_s = lambda: 5.0
+    replay = span(120, 125)
+    feed(stream, replay)
+    assert stream.upstream.rewind.seam is None
+    assert not stream.upstream.rewind.bypass
+    assert "PCR overlap passed through without hold" in (tmp_path / "delaybuf.log").read_text()

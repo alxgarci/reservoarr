@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import bisect
 import contextlib
-import hashlib
 import os
 import re
 import shutil
@@ -111,7 +110,6 @@ def run_pipeline(
     ts_channel: str | None = None,
     log_dir: Path | None = None,
     extra_env: dict[str, str] | None = None,
-    claim_exit_first: bool = False,
 ) -> Run:
     """Run cdn_sim + reservoarr.py for duration_s seconds; return collected
     artifacts. Caller asserts on Run.stats_lines() / Run.log_text() / out_ts.
@@ -164,8 +162,6 @@ def run_pipeline(
     # around it. (If a future tweak adds an env knob, document and use it.)
 
     url = f"http://127.0.0.1:{port}/sim-test"
-    if claim_exit_first:
-        (log_dir / f"dryexit-{hashlib.sha256(url.encode()).hexdigest()[:16]}").touch()
 
     cdn = subprocess.Popen(cdn_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:

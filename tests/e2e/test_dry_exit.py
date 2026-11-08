@@ -77,18 +77,6 @@ def test_silent_connection_with_no_cushion_exits(tmp_path, synth_ts, stall_s):
 
 
 @pytest.mark.e2e
-def test_the_second_process_on_a_url_rides_out_its_outage(tmp_path, synth_ts):
-    """The marker is written as an earlier process of this URL would have."""
-    run = run_pipeline(tmp_path, synth_ts, rate_bps=300_010, duration_s=40, front_s=0.0,
-                       outages=[(20.0, 100.0)],
-                       claim_exit_first=True)
-    log = run.log_text()
-    assert not run.exited_by_itself, log
-    assert "staying, at most one exit per stream URL" in log
-    assert "exiting so Dispatcharr" not in log
-
-
-@pytest.mark.e2e
 def test_zero_keeps_the_process_retrying(tmp_path, synth_ts):
     run = run_pipeline(tmp_path, synth_ts, rate_bps=300_010, duration_s=35, front_s=0.0,
                        outages=[(20.0, 100.0)], extra_env={"RESV_DRY_EXIT_S": "0"})

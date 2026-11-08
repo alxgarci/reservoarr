@@ -38,11 +38,10 @@ Reservoir and the TsParser; Stream.pump()
 takes them out through the Pacer into ffmpeg's stdin. The stall watchdog,
 the corrupt-loop watcher on ffmpeg's stderr and the #5 CorruptionDetector
 ask the Upstream to reconnect. An outage that outlasts the reservoir ends the
-process, once per URL per half hour, so Dispatcharr acts on it. Settings are module constants read from
+process, so Dispatcharr can count the failure and eventually switch streams. Settings are module constants read from
 the environment at import.
 """
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -98,10 +97,8 @@ CC_ERR_PER_WIN = int(os.getenv("RESV_CC_ERR_PER_WIN", "3"))           # CC error
 SYNC_ERR_PER_WIN = int(os.getenv("RESV_SYNC_ERR_PER_WIN", "2"))       # sync losses per stats window = flagged
 TS_SUSTAIN_WINS = int(os.getenv("RESV_TS_SUSTAIN_WINS", "2"))         # consecutive flagged windows before acting
 STALL_S = float(os.getenv("RESV_STALL_S", "25"))                      # no-ingest watchdog (#4); >CDN burst-gap, <urlopen 30s; 0=off
-GAP_RECOVER_S = max(0.0, float(os.getenv("RESV_GAP_RECOVER_S", "0")))  # opt-in early reconnect while buffered; 0=off
 GIVEUP_TRIES = int(os.getenv("RESV_GIVEUP_TRIES", "0"))               # exit after N no-data upstream tries so Dispatcharr fails over; 0=retry forever
 DRY_EXIT_S = float(os.getenv("RESV_DRY_EXIT_S", "5"))                 # reservoir empty and no byte for this long: exit so Dispatcharr acts; 0=off
-DRY_EXIT_EVERY_S = 1860.0                                             # at most one such exit per URL; over Dispatcharr's 1800s retry window
 DRY_SPELL_MIN_S = 0.5                                                 # shortest empty spell the stats line's dry= counts
 REJECT_MP4 = os.getenv("RESV_REJECT_MP4", "0") == "1"
 AUDIO_ARGS = {
@@ -139,6 +136,9 @@ REPLAY_STEP_MAX_S = 10.0
 REWIND_MAX_BACK_S = 40.0                                         # only the observed small PCR overlaps
 REWIND_HOLD_MAX_BYTES = 48 * 1024 * 1024                        # bounded pending data; no new env option
 REWIND_RESERVE_S = 10.0                                         # fail open before starving the player
+REWIND_REARM_S = 20.0                                           # resume watching only after cushion recovers
+REWIND_REARM_PROGRESS_S = 2.0                                   # require a stable fresh PCR clock
+REWIND_HOLD_MARGIN_S = 2.0                                      # leave room beyond the overlap and reserve
 REWIND_LOG_INTERVAL_S = 15.0                                   # enabled-gate heartbeat
 REWIND_LOG_PROGRESS_BYTES = 1024 * 1024                        # detail while a hold is active
 TS_WRAP_S = (1 << 33) / 90000.0                                       # PCR base wraps every ~26.5h
@@ -194,9 +194,8 @@ RELAY_DRAIN_S = 2.0
 # time.monotonic(): time.time() is the wall clock, and a backward NTP step of
 # T seconds turned into a single time.sleep(T) inside the pacing loop - long
 # enough and the cushion drains while we sleep, starving the player. Wall
-# clock remains only in log-line timestamps, the output timestamp origin
-# (output_ts_offset(), the RESV_TS_CHANNEL timeline) and the marker of
-# claim_dry_exit(), which has to outlive this process.
+# clock remains only in log-line timestamps and the output timestamp origin
+# (output_ts_offset(), the RESV_TS_CHANNEL timeline).
 
 def stream_id(url):
     """Short, credential-free identifier used in every journal tag.
@@ -281,34 +280,6 @@ def output_ts_offset(timeline, now):
     if timeline:
         return timeline.offset
     return now % TS_WRAP_S if TS_WALLCLOCK else None
-
-
-def claim_dry_exit(url, now):
-    """May this process exit on a dry reservoir? Dispatcharr counts each exit as
-    a failure, and three on one channel with no other stream to try end it,
-    disconnecting the viewers. Only a stream switch or 1800s without a failure
-    clears the count, and a blip short enough to be back within its 8s startup
-    clock does neither: three 8s blips ended a one-stream channel where they had
-    been three freezes. So one exit per URL per DRY_EXIT_EVERY_S, kept in a marker
-    file because the next exit is by another process; later outages ride it out
-    and Dispatcharr's health monitor still acts on them. Returns None when
-    granted, else the seconds since the last exit. A marker that cannot be
-    written cannot keep the limit, so it refuses (float inf). The name is a hash:
-    provider URLs carry credentials."""
-    path = os.path.join(LOG_DIR, f"dryexit-{hashlib.sha256(url.encode()).hexdigest()[:16]}")
-    try:
-        age = now - os.path.getmtime(path)
-    except OSError:
-        age = None
-    if age is not None and 0 <= age < DRY_EXIT_EVERY_S:
-        return age
-    try:
-        with open(path, "w"):
-            pass
-        os.utime(path, (now, now))
-    except OSError:
-        return float("inf")
-    return None
 
 
 def timeline_path():
@@ -1122,6 +1093,7 @@ class RewindSkip:
         self.pcr_pid = self.last_pcr = None
         self.reject_run = 0
         self.bypass = False
+        self.bypass_progress = 0.0
         self.held = bytearray()
         self.seam = self.first = self.last_seen = None
         self.scan = self.advanced_at = 0
@@ -1143,7 +1115,7 @@ class RewindSkip:
         now = time.monotonic()
         if now - self.last_status_at < REWIND_LOG_INTERVAL_S:
             return
-        state = "bypassed until reconnect" if self.bypass else (
+        state = "cooldown" if self.bypass else (
             "holding" if self.seam is not None else "watching")
         self._trace(f"status={state} input={self.seen_bytes / 1e6:.1f}MB "
                     f"scanned_packets={self.scanned_packets} PCRs={self.scanned_pcr} "
@@ -1156,10 +1128,51 @@ class RewindSkip:
         """A flushing reconnect also discards any pending overlap."""
         if REWIND_SKIP:
             self._trace(f"flush requested; discarding {len(self.held)} pending bytes "
-                        f"without ingest; bypassing until reconnect")
+                        f"without ingest; cooling down before rearm")
         self.held.clear()
         self.seam = None
+        self._enter_cooldown()
+
+    def _enter_cooldown(self):
         self.bypass = True
+        self.bypass_progress = 0.0
+        # The released overlap passes through the parser, so the old seam is
+        # no longer a trustworthy anchor for the next candidate.
+        self.pcr_pid = self.last_pcr = None
+        self.reject_run = 0
+
+    def _feed_cooldown(self, data):
+        """Track the new PCR clock while forwarding bytes unchanged."""
+        i = ts_sync(data, 0)
+        if i < 0:
+            return data
+        while i + 188 <= len(data):
+            if data[i] != 0x47:
+                i = ts_sync(data, i + 1)
+                if i < 0:
+                    break
+            self.scanned_packets += 1
+            found = packet_pcr(data, i)
+            if found:
+                pid, pcr, disc = found
+                self.scanned_pcr += 1
+                if self.pcr_pid is None:
+                    self.pcr_pid, self.last_pcr = pid, pcr
+                elif pid == self.pcr_pid:
+                    step = (pcr - self.last_pcr) % TS_WRAP_S
+                    if disc or step >= REPLAY_STEP_MAX_S:
+                        self.bypass_progress = 0.0
+                    elif step > 0:
+                        self.bypass_progress = min(REWIND_REARM_PROGRESS_S, self.bypass_progress + step)
+                    self.last_pcr = pcr
+            i += 188
+        cushion = self._cushion_s()
+        if self.bypass_progress >= REWIND_REARM_PROGRESS_S and cushion >= REWIND_REARM_S:
+            self.bypass = False
+            self._trace(f"filter rearmed in same connection after stable PCR progress "
+                        f"and cushion recovery; pid={self.pcr_pid} last_pcr={self.last_pcr:.3f} "
+                        f"cushion={cushion:.1f}s")
+        return data
 
     def _release(self, reason):
         data = bytes(self.held)
@@ -1168,11 +1181,13 @@ class RewindSkip:
         elapsed = time.monotonic() - self.hold_started if self.hold_started is not None else 0.0
         self.held.clear()
         self.seam = None
-        self.bypass = True
+        self._enter_cooldown()
         self._trace(f"{reason}; passing through {len(data)} held bytes; "
                     f"first_pcr={first} last_seen_pcr={last} seam_pcr={seam} "
                     f"cushion={cushion:.1f}s held_for={elapsed:.1f}s; "
-                    f"filter bypassed until next connection")
+                    f"filter cooling down; will rearm in this connection after "
+                    f"{REWIND_REARM_PROGRESS_S:.0f}s stable PCR progress and "
+                    f"{REWIND_REARM_S:.0f}s cushion")
         return data
 
     def release_held(self):
@@ -1249,7 +1264,7 @@ class RewindSkip:
             self.seen_bytes += len(data)
         self._heartbeat()
         if self.bypass:
-            return data
+            return self._feed_cooldown(data)
         if self.seam is not None:
             return self._feed_held(data)
         i = ts_sync(data, 0)
@@ -1283,6 +1298,16 @@ class RewindSkip:
                 elif pid == self.pcr_pid and pcr != self.last_pcr:
                     raw = pcr - self.last_pcr
                     if not disc and -REWIND_MAX_BACK_S <= raw < -0.5:
+                        cushion = self._cushion_s()
+                        needed = REWIND_RESERVE_S - raw + REWIND_HOLD_MARGIN_S
+                        if cushion < needed:
+                            self._trace(f"PCR overlap passed through without hold: "
+                                        f"back={-raw:.1f}s cushion={cushion:.1f}s "
+                                        f"required={needed:.1f}s to preserve safety reserve")
+                            self.last_pcr = pcr
+                            self.reject_run = 0
+                            i += 188
+                            continue
                         self.seam = self.last_pcr
                         self.first = self.last_seen = pcr
                         self.held = bytearray(data[i:])
@@ -1543,28 +1568,17 @@ class Upstream:
         restarts while it is full."""
         last_in = -1
         last_adv = time.monotonic()
-        tick = min(2.0, max(0.25, GAP_RECOVER_S / 4)) if GAP_RECOVER_S else 2.0
-        while not self.stop.wait(tick):
+        while not self.stop.wait(2.0):
             cur = self.arrived_total
             if cur != last_in or self.reservoir.full:
                 last_in = cur
                 last_adv = time.monotonic()
                 continue
             gap = time.monotonic() - last_adv
-            # Recover a quiet but still-connected edge before the existing
-            # reservoir runs dry. A new connection may supply the missing
-            # bytes; never flush the good bytes already waiting for ffmpeg.
-            if (GAP_RECOVER_S and gap >= GAP_RECOVER_S and self.last_arrival is not None
-                    and self.reservoir.bytes and self.response is not None
-                    and not self.force.is_set()):
-                if self.request_reconnect(
-                        f"upstream gap {gap:.1f}s with {self.reservoir.bytes / 1e6:.1f}MB buffered; "
-                        "reconnecting early, buffer kept", flush=False):
-                    last_adv = time.monotonic()
-            elif (STALL_S > 0 and gap > STALL_S and not self.force.is_set()
-                  and self.request_reconnect(
-                      f"upstream stalled (no data {gap:.0f}s) - reconnecting, buffer kept",
-                      flush=False)):
+            if (gap > STALL_S and not self.force.is_set()
+                    and self.request_reconnect(
+                        f"upstream stalled (no data {gap:.0f}s) - reconnecting, buffer kept",
+                        flush=False)):
                 last_adv = time.monotonic()
 
     def take_max_gap(self):
@@ -2012,8 +2026,8 @@ class Stream:
     def dry_exit_due(self):
         """Seconds without a byte if it is time to give the channel back to
         Dispatcharr, else None. Called with the reservoir empty and data already
-        delivered. Dispatcharr only sees an outage through its health monitor,
-        20-25s of dead air and then the same URL first; on exit it acts at once.
+        delivered. Dispatcharr retries the same URL until its attempt limit,
+        then switches streams; each dry process must be allowed to exit.
         A process that has delivered nothing never gets here: it stays to wait
         for its first byte, which is what lets a channel with no backups recover.
         Junk that no PCR ever came out of does not count as delivered either."""
@@ -2096,7 +2110,7 @@ class Stream:
             snapshot = self.reservoir.snapshot(AUDIO_PROBE_BYTES) if selector.start_errors else b""
             selector.choose_start(snapshot, len(self.parser.audio_pids))
         timeline = Timeline(timeline_path(), time.time()) if TS_CHANNEL else None
-        if STALL_S > 0 or GAP_RECOVER_S > 0:
+        if STALL_S > 0:
             threading.Thread(target=self.upstream.stall_watchdog, daemon=True).start()
 
         def on_term(signum, frame):
@@ -2156,7 +2170,6 @@ class Stream:
         with nothing left to release (dry_exit_due)."""
         pacer = pacer or Pacer(self.parser, self.reservoir)
         delivered = False
-        told_staying = False
         out_since_stats = 0
         last_stats = time.monotonic()
         tail = b""                                                    # see align_to_188(): ffmpeg expects 188-aligned writes
@@ -2172,20 +2185,12 @@ class Stream:
                     ff.stdin.write(aligned)
                     out_since_stats += len(aligned)
                     delivered = True
-                told_staying = False
             elif delivered:
                 silent = self.dry_exit_due()
                 if silent is not None:
-                    refused = claim_dry_exit(self.upstream.url, time.time())
-                    if refused is None:
-                        log(f"upstream down and reservoir dry (no data {silent:.0f}s); "
-                            f"exiting so Dispatcharr can reconnect or fail over")
-                        break
-                    if not told_staying:
-                        told_staying = True
-                        since = "marker not writable" if refused == float("inf") else f"last exit {refused:.0f}s ago"
-                        log(f"upstream down and reservoir dry (no data {silent:.0f}s); "
-                            f"staying, at most one exit per stream URL every {DRY_EXIT_EVERY_S / 60:.0f} min ({since})")
+                    log(f"upstream down and reservoir dry (no data {silent:.0f}s); "
+                        "exiting so Dispatcharr can retry or fail over")
+                    break
             now = time.monotonic()
             if timeline and now - timeline.saved_at >= TS_SAVE_EVERY_S:
                 timeline.save(time.time())
